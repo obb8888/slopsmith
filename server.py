@@ -876,6 +876,40 @@ async def get_song_info(filename: str):
 
 # ── Highway WebSocket ─────────────────────────────────────────────────────────
 
+# Cache extracted PSARCs to avoid re-extraction on arrangement switch
+_extract_cache = {}  # filename -> (tmp_dir, song, timestamp)
+_extract_cache_lock = threading.Lock()
+
+
+def _get_or_extract(filename, psarc_path):
+    """Return cached extraction or extract fresh."""
+    import time
+    with _extract_cache_lock:
+        cached = _extract_cache.get(filename)
+        if cached:
+            tmp, song, ts = cached
+            if Path(tmp).exists() and (time.time() - ts) < 300:  # 5 min cache
+                return tmp, song, False  # False = not new
+            else:
+                shutil.rmtree(tmp, ignore_errors=True)
+                del _extract_cache[filename]
+
+    tmp = tempfile.mkdtemp(prefix="rs_web_")
+    unpack_psarc(str(psarc_path), tmp)
+    song = load_song(tmp)
+
+    with _extract_cache_lock:
+        # Clean old entries if cache gets too big
+        if len(_extract_cache) > 10:
+            oldest = min(_extract_cache, key=lambda k: _extract_cache[k][2])
+            old_tmp = _extract_cache.pop(oldest)[0]
+            shutil.rmtree(old_tmp, ignore_errors=True)
+        import time as _t
+        _extract_cache[filename] = (tmp, song, _t.time())
+
+    return tmp, song, True  # True = freshly extracted
+
+
 @app.websocket("/ws/highway/{filename:path}")
 async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1):
     """Stream song data for the highway renderer over WebSocket."""
@@ -893,16 +927,16 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
         await websocket.close()
         return
 
-    tmp = tempfile.mkdtemp(prefix="rs_web_")
+    tmp = None
+    owns_tmp = False
     try:
         # Send keepalive so reverse proxies don't timeout during extraction
         await websocket.send_json({"type": "loading", "stage": "Extracting..."})
 
         def _extract():
-            unpack_psarc(str(psarc_path), tmp)
-            return load_song(tmp)
+            return _get_or_extract(filename, psarc_path)
 
-        song = await asyncio.get_event_loop().run_in_executor(None, _extract)
+        tmp, song, owns_tmp = await asyncio.get_event_loop().run_in_executor(None, _extract)
 
         if not song.arrangements:
             await websocket.send_json({"error": "No arrangements found"})
@@ -1107,7 +1141,7 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
             pass
 
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        pass  # Don't clean up — cached for arrangement switching
 
 
 # ── Audio serving ─────────────────────────────────────────────────────────────
