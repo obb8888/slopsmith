@@ -187,6 +187,63 @@
 
     <!-- Global audio element (outside player so it's always accessible) -->
     <audio id="audio" preload="auto"></audio>
+    <script>
+    // Web Audio API fallback for iOS WKWebView which can't play WAV via <audio>
+    (function() {
+        var _waCtx = null, _waSource = null, _waStartTime = 0, _waBuffer = null, _waPlaying = false, _waLoading = false;
+        var audioEl = document.getElementById('audio');
+
+        window._webAudioFallback = {
+            load: function(url, cb) {
+                if (!url || _waLoading) return;
+                _waLoading = true;
+                if (!_waCtx) _waCtx = new (window.AudioContext || window.webkitAudioContext)();
+                console.log('[WebAudio] Loading: ' + url);
+                var xhr = new XMLHttpRequest();
+                xhr.open('GET', url, true);
+                xhr.responseType = 'arraybuffer';
+                xhr.onload = function() {
+                    _waCtx.decodeAudioData(xhr.response, function(decoded) {
+                        _waBuffer = decoded;
+                        _waLoading = false;
+                        console.log('[WebAudio] Decoded: ' + decoded.duration.toFixed(1) + 's');
+                        if (cb) cb();
+                    }, function(e) {
+                        _waLoading = false;
+                        console.error('[WebAudio] Decode error:', e);
+                    });
+                };
+                xhr.onerror = function() { _waLoading = false; };
+                xhr.send();
+            },
+            play: function() {
+                if (!_waBuffer || !_waCtx) return false;
+                this.stop();
+                if (_waCtx.state === 'suspended') _waCtx.resume();
+                _waSource = _waCtx.createBufferSource();
+                _waSource.buffer = _waBuffer;
+                _waSource.playbackRate.value = audioEl.playbackRate || 1;
+                _waSource.connect(_waCtx.destination);
+                _waStartTime = _waCtx.currentTime;
+                _waSource.start(0);
+                _waPlaying = true;
+                console.log('[WebAudio] Playing');
+                return true;
+            },
+            stop: function() {
+                if (_waSource) { try { _waSource.stop(); } catch(e){} _waSource = null; }
+                _waPlaying = false;
+            },
+            getTime: function() {
+                if (!_waPlaying || !_waCtx) return 0;
+                return _waCtx.currentTime - _waStartTime;
+            },
+            isActive: function() { return _waPlaying; },
+            isReady: function() { return !!_waBuffer; },
+            getDuration: function() { return _waBuffer ? _waBuffer.duration : 0; }
+        };
+    })();
+    </script>
 
     <!-- ══ PLAYER ═════════════════════════════════════════════════════════ -->
     <div id="player" class="screen">

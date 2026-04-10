@@ -895,8 +895,14 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
 
     tmp = tempfile.mkdtemp(prefix="rs_web_")
     try:
-        unpack_psarc(str(psarc_path), tmp)
-        song = load_song(tmp)
+        # Send keepalive so reverse proxies don't timeout during extraction
+        await websocket.send_json({"type": "loading", "stage": "Extracting..."})
+
+        def _extract():
+            unpack_psarc(str(psarc_path), tmp)
+            return load_song(tmp)
+
+        song = await asyncio.get_event_loop().run_in_executor(None, _extract)
 
         if not song.arrangements:
             await websocket.send_json({"error": "No arrangements found"})
@@ -933,12 +939,15 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
         arr = song.arrangements[best]
 
         # Convert audio with unique filename
+        await websocket.send_json({"type": "loading", "stage": "Converting audio..."})
         audio_url = None
         audio_id = Path(filename).stem.replace(" ", "_")
         wem_files = find_wem_files(tmp)
         if wem_files:
             try:
-                audio_path = convert_wem(wem_files[0], os.path.join(tmp, "audio"))
+                def _convert():
+                    return convert_wem(wem_files[0], os.path.join(tmp, "audio"))
+                audio_path = await asyncio.get_event_loop().run_in_executor(None, _convert)
                 ext = Path(audio_path).suffix  # .mp3, .ogg, or .wav
                 audio_dest = STATIC_DIR / f"audio_{audio_id}{ext}"
                 shutil.copy2(audio_path, audio_dest)
@@ -958,6 +967,8 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
             "arrangement_index": best,
             "arrangements": arr_list,
             "audio_url": audio_url,
+            "tuning": arr.tuning,
+            "capo": arr.capo,
         })
 
         # Send beats

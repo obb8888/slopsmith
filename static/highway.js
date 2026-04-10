@@ -875,6 +875,9 @@ const highway = (() => {
                     return;
                 }
                 switch (msg.type) {
+                    case 'loading':
+                        console.log('Loading:', msg.stage);
+                        break;
                     case 'song_info':
                         songInfo = msg;
                         document.getElementById('hud-artist').textContent = msg.artist;
@@ -993,6 +996,8 @@ const highway = (() => {
         getSections() { return sections; },
         getSongInfo() { return songInfo; },
         addDrawHook(fn) { _drawHooks.push(fn); },
+        project(tOffset) { return project(tOffset); },
+        fretX(fret, scale, w) { return fretX(fret, scale, w); },
 
         toggleLyrics() {
             showLyrics = !showLyrics;

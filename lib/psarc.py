@@ -5,7 +5,11 @@ import struct
 import zlib
 from pathlib import Path
 
-from Crypto.Cipher import AES
+try:
+    from Crypto.Cipher import AES
+except ImportError:
+    # Pure-Python fallback for iOS/platforms without pycryptodome
+    import aes_fallback as AES
 
 MAGIC = b"PSAR"
 BLOCK_SIZE = 65536

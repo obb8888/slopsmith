@@ -600,11 +600,40 @@ function changeArrangement(index) {
 
 function togglePlay() {
     if (isPlaying) {
-        audio.pause(); isPlaying = false;
+        audio.pause();
+        if (window._webAudioFallback) window._webAudioFallback.stop();
+        isPlaying = false;
         document.getElementById('btn-play').textContent = '▶ Play';
     } else {
-        audio.play(); isPlaying = true;
+        isPlaying = true;
         document.getElementById('btn-play').textContent = '⏸ Pause';
+        // Try native audio first
+        audio.play().then(function() {
+            // Check if it actually works after 1s
+            setTimeout(function() {
+                if (isPlaying && audio.currentTime < 0.1 && window._webAudioFallback) {
+                    // Native audio failed — try Web Audio
+                    if (window._webAudioFallback.isReady()) {
+                        window._webAudioFallback.play();
+                    } else {
+                        window._webAudioFallback.load(audio.src, function() {
+                            if (isPlaying) window._webAudioFallback.play();
+                        });
+                    }
+                }
+            }, 1000);
+        }).catch(function() {
+            // Native play rejected — go straight to Web Audio
+            if (window._webAudioFallback && audio.src) {
+                if (window._webAudioFallback.isReady()) {
+                    window._webAudioFallback.play();
+                } else {
+                    window._webAudioFallback.load(audio.src, function() {
+                        if (isPlaying) window._webAudioFallback.play();
+                    });
+                }
+            }
+        });
     }
 }
 
@@ -827,7 +856,27 @@ setInterval(() => {
         lastAudioTime = audio.currentTime;
         document.getElementById('hud-time').textContent = `${formatTime(audio.currentTime)} / ${formatTime(audio.duration)}`;
     }
-    if (!_countingIn) highway.setTime(audio.currentTime);
+    // Check Web Audio fallback first
+    var waFb = window._webAudioFallback;
+    var waTime = (waFb && waFb.isActive()) ? waFb.getTime() : -1;
+
+    if (waTime >= 0 && isPlaying && !_countingIn) {
+        // Web Audio is playing — use its time
+        highway.setTime(waTime + (window._slopsmithSyncOffset || 0));
+        var dur = waFb.getDuration() || 0;
+        document.getElementById('hud-time').textContent = formatTime(waTime) + ' / ' + formatTime(dur);
+    } else if (isPlaying && audio.currentTime < 0.1 && !_countingIn) {
+        // Audio stuck — use timer fallback (no audio)
+        if (!window._iosFbStart) window._iosFbStart = Date.now();
+        var elapsed = (Date.now() - window._iosFbStart) / 1000;
+        if (elapsed > 2) {
+            highway.setTime(elapsed * (audio.playbackRate || 1));
+            document.getElementById('hud-time').textContent = formatTime(elapsed) + ' / --:--';
+        }
+    } else {
+        window._iosFbStart = null;
+        if (!_countingIn) highway.setTime(audio.currentTime + (window._slopsmithSyncOffset || 0));
+    }
 }, 1000 / 60);
 
 // Keyboard shortcuts (player only)
