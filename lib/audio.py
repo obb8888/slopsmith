@@ -43,59 +43,41 @@ def convert_wem(wem_path: str, output_base: str) -> str:
     Convert a WEM file to a playable format.
     Returns path to the converted audio file.
     """
-    # Try vgmstream-cli → WAV via stdout → ffmpeg → MP3 via stdout
-    # On Android, native binaries can't write to app dirs (SELinux W^X).
-    # Solution: pipe output through stdout so Python handles all file I/O.
     vgmstream = _vgmstream_cmd()
     if vgmstream:
-        # vgmstream -o - outputs WAV to stdout
         wav = output_base + ".wav"
         r = subprocess.run(
-            [vgmstream, "-o", "-", wem_path], capture_output=True
+            [vgmstream, "-o", wav, wem_path], capture_output=True, timeout=120
         )
-        if r.returncode == 0 and len(r.stdout) > 100:
-            # Write WAV from stdout
-            with open(wav, 'wb') as f:
-                f.write(r.stdout)
-
+        if r.returncode == 0 and os.path.exists(wav) and os.path.getsize(wav) > 100:
             ffmpeg = _ffmpeg_cmd()
             if ffmpeg:
-                # ffmpeg reads WAV, outputs MP3 to stdout via pipe:1
                 mp3 = output_base + ".mp3"
                 r2 = subprocess.run(
-                    [ffmpeg, "-y", "-i", wav, "-b:a", "192k", "-f", "mp3", "pipe:1"],
-                    capture_output=True,
+                    [ffmpeg, "-y", "-i", wav, "-b:a", "192k", mp3],
+                    capture_output=True, timeout=120,
                 )
-                if r2.returncode == 0 and len(r2.stdout) > 100:
-                    with open(mp3, 'wb') as f:
-                        f.write(r2.stdout)
+                if r2.returncode == 0 and os.path.exists(mp3) and os.path.getsize(mp3) > 100:
                     os.remove(wav)
                     return mp3
             return wav
 
-    # Try ffmpeg directly (some builds handle Wwise)
     ffmpeg = _ffmpeg_cmd()
     if ffmpeg:
-        # Output MP3 to stdout
         mp3 = output_base + ".mp3"
         r = subprocess.run(
-            [ffmpeg, "-y", "-i", wem_path, "-b:a", "192k", "-f", "mp3", "pipe:1"],
-            capture_output=True,
+            [ffmpeg, "-y", "-i", wem_path, "-b:a", "192k", mp3],
+            capture_output=True, timeout=120,
         )
-        if r.returncode == 0 and len(r.stdout) > 100:
-            with open(mp3, 'wb') as f:
-                f.write(r.stdout)
+        if r.returncode == 0 and os.path.exists(mp3) and os.path.getsize(mp3) > 100:
             return mp3
 
-        # Try WAV to stdout
         wav = output_base + ".wav"
         r = subprocess.run(
-            [ffmpeg, "-y", "-i", wem_path, "-f", "wav", "pipe:1"],
-            capture_output=True,
+            [ffmpeg, "-y", "-i", wem_path, wav],
+            capture_output=True, timeout=120,
         )
-        if r.returncode == 0 and len(r.stdout) > 100:
-            with open(wav, 'wb') as f:
-                f.write(r.stdout)
+        if r.returncode == 0 and os.path.exists(wav) and os.path.getsize(wav) > 100:
             return wav
 
     # Try ww2ogg
