@@ -212,6 +212,7 @@ Routes are registered under `/api/plugins/{plugin_id}/` to avoid conflicts.
 | [Find More CDLC](https://github.com/masc0t/slopsmith-plugin-find-more) | Search for more CDLC by the same artist | `git clone ...slopsmith-plugin-find-more.git find_more` |
 | [Piano Highway](https://github.com/byrongamatos/slopsmith-plugin-piano) | Scrolling piano/keyboard view for Keys arrangements with MIDI input | `git clone ...slopsmith-plugin-piano.git piano` |
 | [Studio](https://github.com/byrongamatos/slopsmith-plugin-studio) | Collaborative band recording and multi-track mixing | `git clone ...slopsmith-plugin-studio.git studio` |
+| [Drum Highway](https://github.com/byrongamatos/slopsmith-plugin-drums) | Lane-based drum highway with MIDI drum pad input and built-in sounds | `git clone ...slopsmith-plugin-drums.git drums` |
 | [Invert Highway](https://github.com/masc0t/slopsmith-plugin-invert-highway) | Flip the highway note direction | `git clone ...slopsmith-plugin-invert-highway.git invert_highway` |
 
 Install any plugin by cloning it into your `plugins/` directory and restarting:
