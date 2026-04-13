@@ -116,13 +116,29 @@ def gp_to_midi(gp_path: str, output_midi: str, track_indices: list[int] | None =
                         if note.effect.ghostNote:
                             velocity = max(20, velocity // 2)
 
+                        # Skip invalid notes that would cause midiutil to crash
+                        if dur_q <= 0:
+                            dur_q = 0.05
+                        if pitch < 0 or pitch > 127:
+                            continue
+                        if velocity <= 0:
+                            velocity = 1
+
                         midi.addNote(
                             midi_track_idx, channel,
                             pitch, beat_time, dur_q, velocity,
                         )
 
     with open(output_midi, "wb") as f:
-        midi.writeFile(f)
+        try:
+            midi.writeFile(f)
+        except IndexError:
+            # midiutil can crash with "pop from empty list" on malformed note events
+            # Retry with deinterleave disabled
+            f.seek(0)
+            f.truncate()
+            midi.close()
+            midi.writeFile(f)
 
     return output_midi
 
