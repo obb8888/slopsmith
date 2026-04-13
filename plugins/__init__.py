@@ -36,14 +36,14 @@ def _install_requirements(plugin_dir: Path, plugin_id: str):
     if marker.exists() and marker.read_text().strip() == req_hash:
         return True  # Already installed, same requirements
 
-    print(f"[Plugin] Installing requirements for '{plugin_id}'...")
+    print(f"[Plugin] Installing requirements for '{plugin_id}' (this can take a while for large deps)...")
     try:
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install",
              "--target", pip_target,
              "--quiet",
              "-r", str(req_file)],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=1800,
         )
         if result.returncode == 0:
             marker.write_text(req_hash)
