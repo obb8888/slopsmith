@@ -572,6 +572,7 @@ load_plugins(app, {
     "get_dlc_dir": _get_dlc_dir,
     "extract_meta": _extract_meta_for_file,
     "meta_db": meta_db,
+    "get_sloppak_cache_dir": lambda: SLOPPAK_CACHE_DIR,
 })
 
 
