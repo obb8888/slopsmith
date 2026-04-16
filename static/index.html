@@ -198,6 +198,14 @@
                     </div>
                     <p class="text-xs text-gray-600 mt-1">Rescan checks for new songs. Full Rescan clears the cache and re-imports everything.</p>
                 </div>
+                <div>
+                    <label class="text-sm font-medium text-gray-400 mb-2 block">Plugin Updates</label>
+                    <div class="flex items-center gap-3 mb-2">
+                        <button onclick="checkPluginUpdates()" id="btn-check-updates" class="bg-dark-600 hover:bg-dark-500 px-5 py-2.5 rounded-xl text-sm text-gray-300 transition">Check for Updates</button>
+                        <span id="updates-status" class="text-xs text-gray-500"></span>
+                    </div>
+                    <div id="plugin-updates-list" class="space-y-2"></div>
+                </div>
                 <!-- Plugin settings injected here -->
                 <div id="plugin-settings" class="space-y-6"></div>
                 <div id="settings-status" class="text-sm text-gray-500"></div>

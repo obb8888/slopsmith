@@ -529,6 +529,59 @@ async function fullRescanLibrary() {
     }, 1000);
 }
 
+// ── Plugin Updates ───────────────────────────────────────────────────────
+async function checkPluginUpdates() {
+    const btn = document.getElementById('btn-check-updates');
+    const status = document.getElementById('updates-status');
+    const list = document.getElementById('plugin-updates-list');
+    btn.disabled = true;
+    btn.textContent = 'Checking...';
+    status.textContent = '';
+    list.innerHTML = '';
+    try {
+        const resp = await fetch('/api/plugins/updates');
+        const data = await resp.json();
+        const updates = data.updates || {};
+        const keys = Object.keys(updates);
+        if (keys.length === 0) {
+            status.textContent = 'All plugins are up to date.';
+        } else {
+            status.textContent = `${keys.length} update${keys.length > 1 ? 's' : ''} available`;
+            for (const id of keys) {
+                const u = updates[id];
+                const row = document.createElement('div');
+                row.className = 'flex items-center gap-3 bg-dark-700 rounded-lg px-4 py-2';
+                row.innerHTML = `
+                    <span class="text-sm text-gray-300 flex-1">${u.name} <span class="text-xs text-gray-500">(${u.behind} commit${u.behind > 1 ? 's' : ''} behind — ${u.local} → ${u.remote})</span></span>
+                    <button onclick="updatePlugin('${id}', this)" class="bg-accent/20 hover:bg-accent/30 text-accent-light px-3 py-1 rounded-lg text-xs transition">Update</button>`;
+                list.appendChild(row);
+            }
+        }
+    } catch (e) {
+        status.textContent = 'Failed to check for updates.';
+    }
+    btn.disabled = false;
+    btn.textContent = 'Check for Updates';
+}
+
+async function updatePlugin(pluginId, btn) {
+    btn.disabled = true;
+    btn.textContent = 'Updating...';
+    try {
+        const resp = await fetch(`/api/plugins/${pluginId}/update`, { method: 'POST' });
+        const data = await resp.json();
+        if (data.ok) {
+            btn.textContent = 'Updated — restart to apply';
+            btn.className = 'bg-green-900/30 text-green-400 px-3 py-1 rounded-lg text-xs';
+        } else {
+            btn.textContent = 'Failed';
+            btn.title = data.error || '';
+        }
+    } catch (e) {
+        btn.textContent = 'Error';
+    }
+}
+
 // ── Plugin functions loaded dynamically from plugin screen.js files ──────
 // (searchCF, installCF, loginCF, searchUG, buildFromUG, etc.)
 
