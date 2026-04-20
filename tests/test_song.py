@@ -282,3 +282,36 @@ def test_arrangement_to_wire_is_json_safe():
     )
     wire = arrangement_to_wire(arr)
     assert json.loads(json.dumps(wire)) == wire
+
+
+# ── Wire-format default-value fallbacks (#44) ────────────────────────────────
+# Pin the fallback values embedded in arrangement_from_wire() so future
+# refactors can't silently change what a sparse wire dict deserializes to.
+
+def test_anchor_missing_width_defaults_to_four():
+    # arrangement_from_wire: `width=int(a.get("width", 4))` at song.py:198
+    arr = arrangement_from_wire({
+        "name": "Lead",
+        "anchors": [{"time": 0.0, "fret": 1}],  # no "width" key
+    })
+    assert len(arr.anchors) == 1
+    assert arr.anchors[0].width == 4
+
+
+def test_chord_template_missing_fingers_frets_defaults_to_negative_ones():
+    # arrangement_from_wire: fingers/frets default to `[-1] * 6` at song.py:209-210
+    arr = arrangement_from_wire({
+        "name": "Rhythm",
+        "templates": [{"name": "Em"}],  # no "fingers" or "frets" keys
+    })
+    assert len(arr.chord_templates) == 1
+    ct = arr.chord_templates[0]
+    assert ct.name == "Em"
+    assert ct.fingers == [-1, -1, -1, -1, -1, -1]
+    assert ct.frets == [-1, -1, -1, -1, -1, -1]
+
+
+def test_chord_with_empty_notes_list_round_trips():
+    # A chord with no notes (unusual but valid input) should survive round-trip.
+    c = Chord(time=1.0, chord_id=3, notes=[])
+    assert chord_from_wire(chord_to_wire(c)) == c
