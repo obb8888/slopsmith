@@ -1,7 +1,9 @@
 """Generate MIDI and render audio from a Guitar Pro file."""
 
+import glob
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -143,29 +145,129 @@ def gp_to_midi(gp_path: str, output_midi: str, track_indices: list[int] | None =
     return output_midi
 
 
+def _find_soundfont() -> str | None:
+    """Locate a .sf2 soundfont for MIDI rendering.
+
+    Precedence:
+      1. ``SLOPSMITH_SOUNDFONT`` env var (user override / desktop-app-supplied)
+      2. Bundled ``<RESOURCESPATH>/soundfonts/*.sf2`` (Electron desktop builds)
+      3. Common system locations per OS.
+    """
+    override = os.environ.get("SLOPSMITH_SOUNDFONT")
+    if override:
+        if os.path.isfile(override):
+            return override
+        print(
+            f"[slopsmith] SLOPSMITH_SOUNDFONT is set to {override!r} but that "
+            "file does not exist; falling back to other sources.",
+            file=sys.stderr,
+        )
+
+    resources = os.environ.get("RESOURCESPATH")
+    if resources:
+        matches = sorted(glob.glob(os.path.join(resources, "soundfonts", "*.sf2")))
+        if matches:
+            return matches[0]
+
+    candidates: list[str] = []
+    if sys.platform.startswith("linux"):
+        candidates += [
+            "/usr/share/soundfonts/FluidR3_GM.sf2",
+            "/usr/share/soundfonts/FluidR3_GS.sf2",
+            "/usr/share/soundfonts/default.sf2",
+            "/usr/share/sounds/sf2/FluidR3_GM.sf2",
+            "/usr/share/sounds/sf2/default-GM.sf2",
+        ]
+    elif sys.platform == "darwin":
+        candidates += [
+            "/opt/homebrew/share/sounds/sf2/FluidR3_GM.sf2",
+            "/opt/homebrew/share/soundfonts/FluidR3_GM.sf2",
+            "/usr/local/share/sounds/sf2/FluidR3_GM.sf2",
+            "/usr/local/share/soundfonts/FluidR3_GM.sf2",
+        ]
+    elif sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            # "Slopsmith" matches slopsmith-desktop's Electron productName
+            # (app.getPath('userData') resolves to %APPDATA%\Slopsmith on Windows).
+            for pattern in (
+                os.path.join(appdata, "Slopsmith", "soundfonts", "*.sf2"),
+                os.path.join(appdata, "SoundFonts", "*.sf2"),
+            ):
+                candidates += sorted(glob.glob(pattern))
+
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _soundfont_install_hint() -> str:
+    if sys.platform.startswith("linux"):
+        return (
+            "Install a soundfont:\n"
+            "  Arch/Manjaro:  sudo pacman -S soundfont-fluid\n"
+            "  Debian/Ubuntu: sudo apt install fluid-soundfont-gm\n"
+            "  Fedora:        sudo dnf install fluid-soundfont-gm"
+        )
+    if sys.platform == "darwin":
+        # Homebrew's fluid-synth formula doesn't bundle a soundfont; the user
+        # needs to fetch one separately (confirmed 2026-04 against the
+        # upstream formula).
+        return (
+            "Download a soundfont (e.g. GeneralUser GS from schristiancollins.com "
+            "or FluidR3_GM from musical-artifacts.com) and either place the .sf2 "
+            "file in /usr/local/share/sounds/sf2/ (Intel) or "
+            "/opt/homebrew/share/sounds/sf2/ (Apple Silicon), or set the "
+            "SLOPSMITH_SOUNDFONT environment variable to its full path."
+        )
+    if sys.platform == "win32":
+        return (
+            "Download a soundfont (e.g. GeneralUser GS from schristiancollins.com or "
+            "FluidR3_GM from musical-artifacts.com) and either place the .sf2 file in "
+            "%APPDATA%\\Slopsmith\\soundfonts\\ or set the SLOPSMITH_SOUNDFONT "
+            "environment variable to its full path."
+        )
+    return "Set SLOPSMITH_SOUNDFONT to the full path of a .sf2 file."
+
+
+def _fluidsynth_install_hint() -> str:
+    if sys.platform.startswith("linux"):
+        return (
+            "Install fluidsynth:\n"
+            "  Arch/Manjaro:  sudo pacman -S fluidsynth\n"
+            "  Debian/Ubuntu: sudo apt install fluidsynth\n"
+            "  Fedora:        sudo dnf install fluidsynth"
+        )
+    if sys.platform == "darwin":
+        return "Install fluidsynth with Homebrew: brew install fluid-synth"
+    if sys.platform == "win32":
+        return (
+            "Install fluidsynth (https://github.com/FluidSynth/fluidsynth/releases) and "
+            "ensure fluidsynth.exe is on your PATH."
+        )
+    return "Install fluidsynth and ensure it is on PATH."
+
+
 def render_midi_to_audio(midi_path: str, output_path: str) -> str:
     """Render MIDI to OGG audio using fluidsynth."""
-    sf_paths = [
-        "/usr/share/soundfonts/FluidR3_GM.sf2",
-        "/usr/share/soundfonts/FluidR3_GS.sf2",
-        "/usr/share/sounds/sf2/FluidR3_GM.sf2",
-    ]
-    soundfont = None
-    for sf in sf_paths:
-        if os.path.exists(sf):
-            soundfont = sf
-            break
-
+    soundfont = _find_soundfont()
     if not soundfont:
-        raise RuntimeError("No soundfont found. Install: sudo pacman -S soundfont-fluid")
+        raise RuntimeError(
+            "No soundfont found. " + _soundfont_install_hint()
+        )
 
     wav_path = output_path + ".wav"
     ogg_path = output_path + ".ogg"
 
-    result = subprocess.run(
-        ["fluidsynth", "-ni", "-T", "wav", "-F", wav_path, "-r", "44100", soundfont, midi_path],
-        capture_output=True, text=True, timeout=600,
-    )
+    try:
+        result = subprocess.run(
+            ["fluidsynth", "-ni", "-T", "wav", "-F", wav_path, "-r", "44100", soundfont, midi_path],
+            capture_output=True, text=True, timeout=600,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError("fluidsynth not found. " + _fluidsynth_install_hint()) from e
+
     if result.returncode != 0 or not os.path.exists(wav_path):
         raise RuntimeError(f"fluidsynth failed: {result.stderr[-300:]}")
 
