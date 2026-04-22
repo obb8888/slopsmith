@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 
 from psarc import unpack_psarc, read_psarc_entries
-from song import load_song, parse_arrangement
+from song import load_song, phrase_to_wire
 from audio import find_wem_files, convert_wem
 from tunings import tuning_name
 import sloppak as sloppak_mod
@@ -1434,6 +1434,27 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
                 "data": chords[i:i+500],
                 "total": len(chords),
             })
+
+        # Per-phrase difficulty data for the master-difficulty slider
+        # (slopsmith#48). Only sent when the source chart had multiple
+        # `<level>` tiers — single-level charts (GP converter, older
+        # sloppaks without phrase data) produce arr.phrases=None, and the
+        # frontend treats the missing message as "slider disabled".
+        # Consumers that don't know about this message type ignore it.
+        #
+        # Chunked at phrase granularity (20 phrases per frame) because
+        # each phrase nests per-level note/chord lists — a single frame
+        # could otherwise exceed proxy/WS size limits on large songs.
+        # Chunk boundary is per-phrase (not per-level) so the frontend
+        # reassembles whole phrase ladders.
+        if arr.phrases:
+            total = len(arr.phrases)
+            for i in range(0, total, 20):
+                await websocket.send_json({
+                    "type": "phrases",
+                    "data": [phrase_to_wire(p) for p in arr.phrases[i:i + 20]],
+                    "total": total,
+                })
 
         await websocket.send_json({"type": "ready"})
 

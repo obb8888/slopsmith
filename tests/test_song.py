@@ -11,12 +11,16 @@ from song import (
     ChordTemplate,
     HandShape,
     Note,
+    Phrase,
+    PhraseLevel,
     arrangement_from_wire,
     arrangement_to_wire,
     chord_from_wire,
     chord_to_wire,
     note_from_wire,
     note_to_wire,
+    phrase_from_wire,
+    phrase_to_wire,
 )
 
 
@@ -179,6 +183,147 @@ def test_arrangement_from_wire_missing_fields_use_defaults():
     assert arr.anchors == []
     assert arr.hand_shapes == []
     assert arr.chord_templates == []
+    # phrases is the "slider disabled" sentinel — absent key → None, NOT [].
+    assert arr.phrases is None
+
+
+# ── Phrase / master-difficulty round-trip (slopsmith#48) ─────────────────────
+
+def test_phrase_empty_round_trip():
+    p = Phrase(start_time=0.0, end_time=10.0, max_difficulty=0, levels=[])
+    assert phrase_from_wire(phrase_to_wire(p)) == p
+
+
+def test_phrase_times_rounded_to_three_decimals():
+    # Pin the rounding behaviour for start_time / end_time so accidental
+    # precision changes (which would shift frontend event timing or break
+    # sloppak round-trips) are caught by the suite.
+    p = Phrase(start_time=1.234567, end_time=9.876543, max_difficulty=0, levels=[])
+    wire = phrase_to_wire(p)
+    assert wire["start_time"] == 1.235
+    assert wire["end_time"] == 9.877
+
+
+def test_phrase_with_multiple_levels_round_trip():
+    p = Phrase(
+        start_time=4.5, end_time=12.25, max_difficulty=2,
+        levels=[
+            PhraseLevel(
+                difficulty=0,
+                notes=[Note(time=5.0, string=0, fret=3)],
+                chords=[],
+                anchors=[Anchor(time=5.0, fret=3, width=4)],
+                hand_shapes=[],
+            ),
+            PhraseLevel(
+                difficulty=1,
+                notes=[
+                    Note(time=5.0, string=0, fret=3),
+                    Note(time=6.5, string=1, fret=5, palm_mute=True),
+                ],
+                chords=[],
+                anchors=[Anchor(time=5.0, fret=3, width=4)],
+                hand_shapes=[],
+            ),
+            PhraseLevel(
+                difficulty=2,
+                notes=[
+                    Note(time=5.0, string=0, fret=3),
+                    Note(time=6.5, string=1, fret=5, palm_mute=True),
+                ],
+                chords=[
+                    Chord(
+                        time=8.0, chord_id=1,
+                        notes=[
+                            Note(time=8.0, string=0, fret=0),
+                            Note(time=8.0, string=1, fret=2),
+                        ],
+                    ),
+                ],
+                anchors=[Anchor(time=5.0, fret=3, width=4)],
+                hand_shapes=[HandShape(chord_id=1, start_time=8.0, end_time=8.5)],
+            ),
+        ],
+    )
+    assert phrase_from_wire(phrase_to_wire(p)) == p
+
+
+def test_arrangement_with_phrases_round_trip():
+    arr = Arrangement(
+        name="Lead",
+        phrases=[
+            Phrase(
+                start_time=0.0, end_time=8.0, max_difficulty=1,
+                levels=[
+                    PhraseLevel(difficulty=0, notes=[Note(time=1.0, string=0, fret=0)]),
+                    PhraseLevel(difficulty=1, notes=[
+                        Note(time=1.0, string=0, fret=0),
+                        Note(time=2.0, string=0, fret=2),
+                    ]),
+                ],
+            ),
+        ],
+    )
+    assert arrangement_from_wire(arrangement_to_wire(arr)) == arr
+
+
+def test_arrangement_wire_omits_phrases_when_none():
+    # Slider-disabled sentinel: arrangements without phrase data must NOT
+    # emit a "phrases" key. Frontends distinguish by presence, not value.
+    arr = Arrangement(name="Bass")
+    wire = arrangement_to_wire(arr)
+    assert "phrases" not in wire
+
+
+def test_arrangement_wire_emits_phrases_when_set():
+    arr = Arrangement(
+        name="Lead",
+        phrases=[Phrase(start_time=0.0, end_time=4.0, max_difficulty=0, levels=[])],
+    )
+    wire = arrangement_to_wire(arr)
+    assert "phrases" in wire
+    assert wire["phrases"] == [{
+        "start_time": 0.0, "end_time": 4.0,
+        "max_difficulty": 0, "levels": [],
+    }]
+
+
+def test_arrangement_wire_omits_phrases_when_empty_list():
+    # An empty list means "no phrase data" just like None — emitting
+    # `"phrases": []` would signal slider-enabled-but-no-ladder, which
+    # is an invalid state for consumers. Normalize at the wire boundary.
+    arr = Arrangement(name="Rhythm", phrases=[])
+    wire = arrangement_to_wire(arr)
+    assert "phrases" not in wire
+
+
+def test_arrangement_from_wire_empty_phrases_list_becomes_none():
+    # Symmetric: an explicit `"phrases": []` on the wire must deserialize
+    # to the None sentinel so the slider-disabled signal is preserved.
+    arr = arrangement_from_wire({"name": "X", "phrases": []})
+    assert arr.phrases is None
+
+
+def test_phrase_wire_is_json_safe():
+    p = Phrase(
+        start_time=1.234, end_time=5.678, max_difficulty=1,
+        levels=[
+            PhraseLevel(
+                difficulty=1,
+                notes=[Note(time=2.0, string=0, fret=5, sustain=0.5, tap=True)],
+                chords=[
+                    Chord(time=3.0, chord_id=2, high_density=True,
+                          notes=[Note(time=3.0, string=0, fret=0)]),
+                ],
+                anchors=[Anchor(time=2.0, fret=5, width=4)],
+                hand_shapes=[HandShape(chord_id=2, start_time=3.0, end_time=3.5)],
+            ),
+        ],
+    )
+    wire = phrase_to_wire(p)
+    # allow_nan=False rejects Infinity/NaN — which JS JSON.parse
+    # also rejects. Keeps the wire strictly browser-compatible.
+    assert json.loads(json.dumps(wire, allow_nan=False)) == wire
 
 
 # ── Dataclass defaults ───────────────────────────────────────────────────────
@@ -229,7 +374,9 @@ def test_note_to_wire_is_json_safe():
         tremolo=True, accent=True, tap=True,
     )
     wire = note_to_wire(n)
-    assert json.loads(json.dumps(wire)) == wire
+    # allow_nan=False rejects Infinity/NaN — which JS JSON.parse
+    # also rejects. Keeps the wire strictly browser-compatible.
+    assert json.loads(json.dumps(wire, allow_nan=False)) == wire
 
 
 def test_chord_to_wire_is_json_safe():
@@ -242,7 +389,9 @@ def test_chord_to_wire_is_json_safe():
         ],
     )
     wire = chord_to_wire(c)
-    assert json.loads(json.dumps(wire)) == wire
+    # allow_nan=False rejects Infinity/NaN — which JS JSON.parse
+    # also rejects. Keeps the wire strictly browser-compatible.
+    assert json.loads(json.dumps(wire, allow_nan=False)) == wire
 
 
 def test_arrangement_to_wire_is_json_safe():
@@ -281,7 +430,9 @@ def test_arrangement_to_wire_is_json_safe():
         ],
     )
     wire = arrangement_to_wire(arr)
-    assert json.loads(json.dumps(wire)) == wire
+    # allow_nan=False rejects Infinity/NaN — which JS JSON.parse
+    # also rejects. Keeps the wire strictly browser-compatible.
+    assert json.loads(json.dumps(wire, allow_nan=False)) == wire
 
 
 # ── Wire-format default-value fallbacks (#44) ────────────────────────────────
