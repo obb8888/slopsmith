@@ -721,40 +721,103 @@ def delete_loop(loop_id: int):
 
 # ── Settings API ──────────────────────────────────────────────────────────────
 
+def _default_settings():
+    """Fallback settings returned when config.json is missing or
+    unreadable. Also used to seed a fresh cfg on first-run POSTs so a
+    single-key write (e.g. the difficulty slider) can't silently wipe
+    defaults that subsequent GETs would have exposed."""
+    return {"dlc_dir": str(DLC_DIR) if DLC_DIR.is_dir() else ""}
+
+
+def _load_config(config_file):
+    """Read and parse config.json. Returns the parsed dict, or None if
+    the file is missing, unreadable, invalid JSON, or parses to a
+    non-dict (e.g. the file contains `[]` or `42`). Callers treat None
+    as "fall back to defaults". Shared between GET and POST so both
+    handle bad files the same way."""
+    if not config_file.exists():
+        return None
+    try:
+        parsed = json.loads(config_file.read_text())
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 @app.get("/api/settings")
 def get_settings():
-    config_file = CONFIG_DIR / "config.json"
-    if config_file.exists():
-        try:
-            return json.loads(config_file.read_text())
-        except Exception:
-            pass
-    return {"dlc_dir": str(DLC_DIR) if DLC_DIR.is_dir() else ""}
+    cfg = _load_config(CONFIG_DIR / "config.json")
+    return cfg if cfg is not None else _default_settings()
 
 
 @app.post("/api/settings")
 def save_settings(data: dict):
+    # Partial-update: merge only keys present in the request body so
+    # single-key POSTs (like the difficulty slider's oninput) don't
+    # clobber unrelated settings on disk.
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     config_file = CONFIG_DIR / "config.json"
-    cfg = {}
-    if config_file.exists():
-        try:
-            cfg = json.loads(config_file.read_text())
-        except Exception:
-            pass
+    # Seed defaults when config.json is missing, unreadable, or parses
+    # to a non-dict (e.g. `[]`, `42`). Without the non-dict guard, the
+    # next `cfg["..."] = ...` assignment would raise TypeError and 500
+    # the public endpoint. Seeding also ensures single-key POSTs (the
+    # difficulty slider's fire-and-forget write) don't produce a config
+    # file missing the dlc_dir fallback GET would have surfaced.
+    cfg = _load_config(config_file)
+    if cfg is None:
+        cfg = _default_settings()
 
     messages = []
-    dlc_path = data.get("dlc_dir", "")
-    if dlc_path:
-        if Path(dlc_path).is_dir():
-            cfg["dlc_dir"] = dlc_path
-            count = sum(1 for f in Path(dlc_path).iterdir() if f.suffix == ".psarc")
-            messages.append(f"DLC folder: {count} .psarc files found")
+    if "dlc_dir" in data:
+        dlc_path = data["dlc_dir"]
+        # null / missing is no-op (preserve on-disk value). Only an
+        # explicit empty string means "clear". Non-string values are
+        # rejected so Path(...) can't be surprised by non-str JSON.
+        if dlc_path is None:
+            pass
+        elif not isinstance(dlc_path, str):
+            return {"error": "dlc_dir must be a string path or empty"}
+        elif dlc_path == "":
+            cfg["dlc_dir"] = ""
         else:
-            return {"error": f"DLC directory not found: {dlc_path}"}
+            if Path(dlc_path).is_dir():
+                cfg["dlc_dir"] = dlc_path
+                count = sum(1 for f in Path(dlc_path).iterdir() if f.suffix == ".psarc")
+                messages.append(f"DLC folder: {count} .psarc files found")
+            else:
+                return {"error": f"DLC directory not found: {dlc_path}"}
 
-    cfg["default_arrangement"] = data.get("default_arrangement", "")
-    cfg["demucs_server_url"] = data.get("demucs_server_url", "")
+    # Both of these are consumed downstream as strings (e.g.
+    # demucs_server_url.rstrip('/') in lib/sloppak_convert.py), so
+    # reject non-string shapes here. Matches the dlc_dir pattern above:
+    # null is no-op, empty string clears, non-string is a structured
+    # error that preserves the on-disk value.
+    for key in ("default_arrangement", "demucs_server_url"):
+        if key in data:
+            raw = data[key]
+            if raw is None:
+                pass
+            elif not isinstance(raw, str):
+                return {"error": f"{key} must be a string or empty"}
+            else:
+                cfg[key] = raw
+    if "master_difficulty" in data:
+        # Coerce defensively — public endpoint, so `null`, `""`, or a
+        # non-numeric string shouldn't 500 the request. float() accepts
+        # both integer and float-shaped strings; anything else returns
+        # a structured error like the dlc_dir branch above.
+        raw = data["master_difficulty"]
+        # Reject bool explicitly: Python makes bool a subclass of int, so
+        # True/False would otherwise coerce to 1/0 and persist as a valid
+        # difficulty. Caller almost certainly means "bad input".
+        if isinstance(raw, bool):
+            return {"error": "master_difficulty must be a number between 0 and 100"}
+        try:
+            cfg["master_difficulty"] = max(0, min(100, int(float(raw))))
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError covers int(float("inf")) / int(float("1e309"))
+            # which Python raises distinctly from ValueError.
+            return {"error": "master_difficulty must be a number between 0 and 100"}
 
     config_file.write_text(json.dumps(cfg, indent=2))
     return {"message": ". ".join(messages) if messages else "Settings saved"}

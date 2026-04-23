@@ -484,6 +484,17 @@ async function loadSettings() {
     document.getElementById('demucs-server-url').value = data.demucs_server_url || '';
     const leftyEl = document.getElementById('setting-lefty');
     if (leftyEl) leftyEl.checked = highway.getLefty();
+    // Restore master-difficulty slider from persisted value (defaults
+    // to 100 when the key is absent — no behaviour change for users
+    // who've never touched the slider).
+    const masteryPct = typeof data.master_difficulty === 'number'
+        ? Math.max(0, Math.min(100, data.master_difficulty))
+        : 100;
+    const masterySlider = document.getElementById('mastery-slider');
+    const masteryLabel = document.getElementById('mastery-label');
+    if (masterySlider) masterySlider.value = masteryPct;
+    if (masteryLabel) masteryLabel.textContent = masteryPct + '%';
+    highway.setMastery(masteryPct / 100);
     // Native folder picker — only present when running inside slopsmith-desktop.
     if (window.slopsmithDesktop && typeof window.slopsmithDesktop.pickDirectory === 'function') {
         document.getElementById('btn-pick-dlc')?.classList.remove('hidden');
@@ -839,6 +850,60 @@ function setVolume(v) {
 function setSpeed(v) {
     audio.playbackRate = parseFloat(v);
     document.getElementById('speed-label').textContent = parseFloat(v).toFixed(2) + 'x';
+}
+// Master-difficulty slider (slopsmith#48). Persists partial via
+// /api/settings — the POST handler merges only the keys present, so
+// this fire-and-forget call doesn't clobber dlc_dir or other settings.
+//
+// Debounced trailing-edge (300ms) so dragging the slider — which fires
+// oninput per pixel — doesn't flood the server with concurrent writes
+// to config.json. highway.setMastery() still fires every oninput so
+// the chart re-filters in real time; only disk persistence waits.
+let _masteryPersistTimer = null;
+function _persistMastery(pct) {
+    if (_masteryPersistTimer) clearTimeout(_masteryPersistTimer);
+    _masteryPersistTimer = setTimeout(() => {
+        _masteryPersistTimer = null;
+        fetch('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ master_difficulty: pct }),
+        }).catch(() => { /* best-effort — next setMastery() will retry */ });
+    }, 300);
+}
+function setMastery(v) {
+    // Guard + clamp: v might be a slider string, a programmatic call
+    // from a plugin, or a restored settings value with a bad shape.
+    // Don't let NaN hit the label (would show "NaN%") or the POST.
+    const parsed = parseInt(v, 10);
+    if (!Number.isFinite(parsed)) return;
+    const pct = Math.max(0, Math.min(100, parsed));
+    document.getElementById('mastery-label').textContent = pct + '%';
+    highway.setMastery(pct / 100);
+    _persistMastery(pct);
+}
+// Reflect phrase-data availability on the slider after every `ready`.
+// The server omits the `phrases` message entirely for single-level
+// sources (GP imports, legacy sloppak), so hasPhraseData() is the
+// right signal to enable/disable the slider.
+function _applyMasteryAvailability(hasPhraseData) {
+    const slider = document.getElementById('mastery-slider');
+    if (!slider) return;
+    if (hasPhraseData) {
+        slider.disabled = false;
+        slider.title = 'Master difficulty — low = simpler chart, high = full';
+    } else {
+        slider.disabled = true;
+        slider.title = 'Source chart has a single difficulty level — slider disabled';
+    }
+}
+if (window.slopsmith) {
+    // slopsmith's event bus dispatches CustomEvent with the payload in
+    // event.detail (see EventTarget setup around line 699), so the
+    // handler receives an Event, not the raw payload.
+    window.slopsmith.on('song:ready', (e) => {
+        _applyMasteryAvailability(!!e.detail?.hasPhraseData);
+    });
 }
 function formatTime(s) { return `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`; }
 

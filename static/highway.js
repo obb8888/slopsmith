@@ -23,6 +23,23 @@ function createHighway() {
     let toneChanges = [];
     let toneBase = "";
     let ready = false;
+    // Master-difficulty (slopsmith#48). _phrases stays null as a
+    // "slider disabled" sentinel when the source chart has no ladder
+    // data (GP imports, legacy sloppak) — the server omits the
+    // `phrases` message entirely in that case. When populated, the
+    // filter maps the slider fraction to a per-phrase level index and
+    // stages _filteredNotes / _filteredChords for the render loop.
+    // _filteredNotes === null means "fall through to flat notes" —
+    // either no phrase data or filter not rebuilt yet.
+    let _phrases = null;
+    // Default to full chart. Persistence lives in the caller (app.js
+    // loadSettings, or a splitscreen plugin managing its own panel
+    // state) so multiple createHighway() instances stay truly
+    // per-instance — no shared localStorage key to race on.
+    let _mastery = 1;
+    let _filteredNotes = null;
+    let _filteredChords = null;
+    let _filteredAnchors = null;
     let showLyrics = localStorage.getItem('showLyrics') !== 'false';
     let _drawHooks = [];  // plugin draw callbacks: fn(ctx, W, H)
     let _renderScale = parseFloat(localStorage.getItem('renderScale') || '1');  // 1 = full, 0.5 = half res
@@ -70,8 +87,11 @@ function createHighway() {
     let displayMaxFret = 12;  // rightmost visible fret (smoothed)
 
     function getAnchorAt(t) {
-        let a = anchors[0] || { fret: 1, width: 4 };
-        for (const anc of anchors) {
+        // Same master-difficulty fallback as the render loops — the
+        // anchor ladder pairs with the note ladder.
+        const src = _filteredAnchors !== null ? _filteredAnchors : anchors;
+        let a = src[0] || { fret: 1, width: 4 };
+        for (const anc of src) {
             if (anc.time > t) break;
             a = anc;
         }
@@ -80,8 +100,9 @@ function createHighway() {
 
     function getMaxFretInWindow(t) {
         // Find the highest fret needed across all anchors visible on screen
+        const src = _filteredAnchors !== null ? _filteredAnchors : anchors;
         let maxFret = 0;
-        for (const anc of anchors) {
+        for (const anc of src) {
             if (anc.time > t + VISIBLE_SECONDS) break;
             if (anc.time + 2 < t) continue;  // skip anchors well in the past
             const top = anc.fret + anc.width;
@@ -519,7 +540,12 @@ function createHighway() {
     }
 
     function drawSustains(W, H) {
-        for (const n of notes) {
+        // Same master-difficulty fallback as drawNotes/drawChords —
+        // without this, sustain bars for filtered-out notes would
+        // still render, leaving orphan rectangles where no note head
+        // is drawn.
+        const src = _filteredNotes !== null ? _filteredNotes : notes;
+        for (const n of src) {
             if (n.sus <= 0.01) continue;
             const end = n.t + n.sus;
             if (end < currentTime || n.t > currentTime + VISIBLE_SECONDS) continue;
@@ -547,20 +573,25 @@ function createHighway() {
     }
 
     function drawNotes(W, H) {
+        // Master-difficulty filter (slopsmith#48): when the source had
+        // phrase-level ladder data, render from the mastery-filtered
+        // array. _filteredNotes stays null for slider-disabled sources
+        // so rendering falls through to the flat notes array unchanged.
+        const src = _filteredNotes !== null ? _filteredNotes : notes;
         // Binary search for visible range
         const tMin = currentTime - 0.25;
         const tMax = currentTime + VISIBLE_SECONDS;
-        let lo = bsearch(notes, tMin);
-        let hi = bsearch(notes, tMax);
+        let lo = bsearch(src, tMin);
+        let hi = bsearch(src, tMax);
 
         // Include sustained notes
-        while (lo > 0 && notes[lo-1].t + notes[lo-1].sus > currentTime) lo--;
+        while (lo > 0 && src[lo-1].t + src[lo-1].sus > currentTime) lo--;
 
         // Collect drawn positions for unison bend detection
         const drawnNotes = [];
 
         for (let i = hi - 1; i >= lo; i--) {
-            const n = notes[i];
+            const n = src[i];
             let tOff = n.t - currentTime;
 
             // Hold sustained notes at now line
@@ -647,13 +678,16 @@ function createHighway() {
     }
 
     function drawChords(W, H) {
+        // See drawNotes — _filteredChords is null for slider-disabled
+        // sources so we fall through to the flat chords array.
+        const src = _filteredChords !== null ? _filteredChords : chords;
         const tMin = currentTime - 0.25;
         const tMax = currentTime + VISIBLE_SECONDS;
-        let lo = bsearchChords(chords, tMin);
-        let hi = bsearchChords(chords, tMax);
+        let lo = bsearchChords(src, tMin);
+        let hi = bsearchChords(src, tMax);
 
         for (let i = hi - 1; i >= lo; i--) {
-            const ch = chords[i];
+            const ch = src[i];
             const p = project(ch.t - currentTime);
             if (!p) continue;
 
@@ -961,6 +995,52 @@ function createHighway() {
         return lo;
     }
 
+    // Rebuild the mastery-filtered note/chord arrays from _phrases +
+    // _mastery. Called on `ready` and on every setMastery(). When
+    // _phrases is null (slider-disabled source), we clear the filtered
+    // arrays — drawNotes/drawChords fall through to the flat arrays.
+    //
+    // Output arrays are pre-sorted by time because phrase iterations
+    // arrive in chronological order and within each level the notes/
+    // chords are time-sorted already (PR 1's parser sorts them), so
+    // concatenation preserves the order. No explicit sort needed.
+    function _rebuildMasteryFilter() {
+        // Null OR empty → fall through to flat arrays. The server's
+        // chunked emission invariant means _phrases should never land
+        // at `[]` in practice (it'd require the `phrases` message to
+        // fire with zero data), but the defensive guard means a bug
+        // on the way in wouldn't blank the chart.
+        if (_phrases === null || _phrases.length === 0) {
+            _filteredNotes = null;
+            _filteredChords = null;
+            _filteredAnchors = null;
+            return;
+        }
+        const outNotes = [];
+        const outChords = [];
+        const outAnchors = [];
+        for (const p of _phrases) {
+            const n = p.levels.length;
+            if (n === 0) continue;
+            // Map slider fraction to a level index. `n` already equals
+            // `max_difficulty + 1` for fully-authored phrases, and
+            // equals the authored-level count otherwise — so indexing
+            // into p.levels.length is both correct and defensive.
+            const idx = Math.min(n - 1, Math.floor(_mastery * n));
+            const lv = p.levels[idx];
+            for (const x of lv.notes)   outNotes.push(x);
+            for (const x of lv.chords)  outChords.push(x);
+            // Anchors drive the fret zoom / pan. Keeping max-mastery
+            // anchors while hiding higher-difficulty notes would leave
+            // the highway panning into empty regions — filter them to
+            // the same level as the notes they pair with.
+            for (const x of lv.anchors) outAnchors.push(x);
+        }
+        _filteredNotes = outNotes;
+        _filteredChords = outChords;
+        _filteredAnchors = outAnchors;
+    }
+
     // ── Public API ───────────────────────────────────────────────────────
     const api = {
         init(canvasEl, container) {
@@ -973,6 +1053,15 @@ function createHighway() {
             window.addEventListener('resize', _resizeHandler);
             ready = false;
             notes = []; chords = []; beats = []; sections = []; anchors = []; lyrics = []; toneChanges = []; toneBase = "";
+            // Reset phrase ladder + filter (slopsmith#48). _mastery
+            // persists across arrangement switches — the slider's
+            // position stays put. Filter rebuilds on the next `ready`
+            // once the new arrangement's phrases arrive (or stays
+            // disabled if the new source has no phrase data).
+            _phrases = null;
+            _filteredNotes = null;
+            _filteredChords = null;
+            _filteredAnchors = null;
         },
 
         resize() {
@@ -1010,6 +1099,28 @@ function createHighway() {
         },
 
         getLefty() { return _lefty; },
+
+        // Master-difficulty (slopsmith#48). Per-instance: splitscreen
+        // plugins that call createHighway() separately get their own
+        // _mastery via closure.
+        setMastery(fraction) {
+            // Same NaN guard as the init (plugins could pass undefined
+            // or a string that coerces badly). Silently ignore — the
+            // caller probably meant to pass a number; keeping the
+            // previous value is safer than propagating NaN into
+            // Math.floor → p.levels[NaN].
+            const next = Number(fraction);
+            if (!Number.isFinite(next)) return;
+            _mastery = Math.max(0, Math.min(1, next));
+            _rebuildMasteryFilter();
+        },
+        getMastery() { return _mastery; },
+        // Align with _rebuildMasteryFilter's own "null OR empty → fall
+        // through" check. If we returned true for _phrases = [], the
+        // slider would be enabled (via song:ready's hasPhraseData) but
+        // dragging it would do nothing (filter stays null). Same
+        // sentinel, same check, single source of truth.
+        hasPhraseData() { return !!(_phrases && _phrases.length > 0); },
 
         connect(wsUrl, opts = {}) {
             _connectOpts = opts;
@@ -1155,11 +1266,34 @@ function createHighway() {
                     case 'tone_changes': toneChanges = msg.data; toneBase = msg.base || ""; break;
                     case 'notes': notes = notes.concat(msg.data); break;
                     case 'chords': chords = chords.concat(msg.data); break;
+                    case 'phrases':
+                        // Accumulate chunks but DON'T rebuild the filter
+                        // until `ready` — rebuilding per chunk would
+                        // cause visual flicker (partial filtered array
+                        // visible while later chunks are still arriving)
+                        // and duplicate work.
+                        if (_phrases === null) _phrases = [];
+                        for (const p of msg.data) _phrases.push(p);
+                        break;
                     case 'ready':
                         ready = true;
-                        console.log(`Highway ready: ${notes.length} notes, ${chords.length} chords`);
+                        _rebuildMasteryFilter();
+                        console.log(`Highway ready: ${notes.length} notes, ${chords.length} chords` +
+                            (_phrases !== null ? `, ${_phrases.length} phrases (mastery ${Math.round(_mastery * 100)}%)` : ""));
                         if (!animFrame) draw();
                         if (api._onReady) api._onReady();
+                        // Broadcast to interested listeners (e.g. the
+                        // difficulty-slider disabled-state update in
+                        // app.js). Fires on every `ready`, including
+                        // arrangement switches — unlike `_onReady`,
+                        // which is a single-use callback slot.
+                        if (window.slopsmith) {
+                            // Reuse api.hasPhraseData so the emit and
+                            // the public getter agree on the sentinel.
+                            window.slopsmith.emit('song:ready', {
+                                hasPhraseData: api.hasPhraseData(),
+                            });
+                        }
                         break;
                 }
             };
@@ -1219,6 +1353,15 @@ function createHighway() {
             if (ws) { ws.close(); ws = null; }
             ready = false;
             notes = []; chords = []; beats = []; sections = []; anchors = []; lyrics = []; toneChanges = []; toneBase = "";
+            // Reset phrase ladder + filter (slopsmith#48). _mastery
+            // persists across arrangement switches — the slider's
+            // position stays put. Filter rebuilds on the next `ready`
+            // once the new arrangement's phrases arrive (or stays
+            // disabled if the new source has no phrase data).
+            _phrases = null;
+            _filteredNotes = null;
+            _filteredChords = null;
+            _filteredAnchors = null;
             const arrParam = arrangement !== undefined ? `?arrangement=${arrangement}` : '';
             // filename might already be encoded from data-play attribute
             const decoded = decodeURIComponent(filename);
