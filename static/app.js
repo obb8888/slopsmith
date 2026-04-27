@@ -1658,6 +1658,25 @@ async function loadPlugins() {
 
                 const settingsResp = await fetch(`/api/plugins/${plugin.id}/settings.html`);
                 settingsDiv.innerHTML = await settingsResp.text();
+                // <script> tags inserted via innerHTML are intentionally
+                // inert per the HTML5 spec — the browser parses them as
+                // DOM nodes but never runs the body. That silently breaks
+                // any plugin settings.html that wires event handlers via
+                // addEventListener (e.g. file pickers, anything that
+                // can't be expressed as an inline onclick=… attribute),
+                // and any inline IIFE that hydrates form values from
+                // localStorage. Re-create each script node — script
+                // elements created via document.createElement DO execute
+                // when appended — so plugins get the script behavior
+                // they'd expect from a normal HTML document.
+                settingsDiv.querySelectorAll('script').forEach(oldScript => {
+                    const newScript = document.createElement('script');
+                    for (const attr of oldScript.attributes) {
+                        newScript.setAttribute(attr.name, attr.value);
+                    }
+                    newScript.textContent = oldScript.textContent;
+                    oldScript.parentNode.replaceChild(newScript, oldScript);
+                });
             }
 
             // Load plugin JS
