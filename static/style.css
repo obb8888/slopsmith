@@ -189,6 +189,98 @@ html { scroll-behavior: smooth; }
     #player-controls button { padding: 4px 8px; font-size: 11px; }
 }
 
+/* Library filter drawer (slopsmith#129/#69) */
+#lib-filter-drawer.open { transform: translateX(0); }
+#lib-filter-drawer .filter-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 500;
+    border: 1px solid rgba(75, 85, 99, 0.5);
+    background: #181830;
+    color: #d1d5db;
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+#lib-filter-drawer .filter-pill:hover { border-color: rgba(64, 128, 224, 0.5); }
+#lib-filter-drawer .filter-pill.state-require {
+    border-color: rgba(34, 197, 94, 0.7);
+    background: rgba(34, 197, 94, 0.15);
+    color: #86efac;
+}
+#lib-filter-drawer .filter-pill.state-exclude {
+    border-color: rgba(248, 113, 113, 0.7);
+    background: rgba(248, 113, 113, 0.15);
+    color: #fca5a5;
+}
+#lib-filter-drawer .filter-pill.state-disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+#lib-filter-drawer .filter-pill::before {
+    content: '';
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: rgba(156, 163, 175, 0.4);
+}
+#lib-filter-drawer .filter-pill.state-require::before { background: #22c55e; }
+#lib-filter-drawer .filter-pill.state-exclude::before {
+    background: #f87171;
+    /* tiny minus indicator: use a horizontal bar instead of dot */
+    width: 10px;
+    height: 2px;
+    border-radius: 1px;
+}
+#lib-filter-drawer .tuning-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 6px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    color: #d1d5db;
+}
+#lib-filter-drawer .tuning-row:hover { background: rgba(64, 128, 224, 0.1); }
+#lib-filter-drawer .tuning-row .tuning-count {
+    margin-left: auto;
+    font-size: 11px;
+    color: #6b7280;
+}
+
+/* Active-filter chips row */
+#lib-filter-chips { display: none; }
+#lib-filter-chips:not(.hidden) { display: flex; }
+#lib-filter-chips .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 8px 3px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    background: #1e1e3a;
+    border: 1px solid rgba(75, 85, 99, 0.5);
+    color: #d1d5db;
+}
+#lib-filter-chips .chip.chip-exclude {
+    border-color: rgba(248, 113, 113, 0.5);
+    color: #fca5a5;
+}
+#lib-filter-chips .chip button {
+    margin-left: 4px;
+    padding: 0 4px;
+    color: #6b7280;
+    font-weight: bold;
+    line-height: 1;
+}
+#lib-filter-chips .chip button:hover { color: #fff; }
+
 /* Audio mixer popover */
 #mixer-popover { min-width: 200px; }
 #mixer-popover .mixer-strip { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 0 10px; }

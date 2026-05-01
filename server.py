@@ -68,20 +68,33 @@ class MetadataDB:
                 arrangements TEXT,
                 has_lyrics INTEGER DEFAULT 0,
                 format TEXT DEFAULT 'psarc',
-                stem_count INTEGER DEFAULT 0
+                stem_count INTEGER DEFAULT 0,
+                stem_ids TEXT DEFAULT '[]',
+                tuning_name TEXT DEFAULT '',
+                tuning_sort_key INTEGER DEFAULT 0
             )
         """)
-        # Idempotent migration for installs that predate the format column.
-        try:
-            self.conn.execute("ALTER TABLE songs ADD COLUMN format TEXT DEFAULT 'psarc'")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            self.conn.execute("ALTER TABLE songs ADD COLUMN stem_count INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
+        # Idempotent migrations for installs that predate each column.
+        for ddl in (
+            "ALTER TABLE songs ADD COLUMN format TEXT DEFAULT 'psarc'",
+            "ALTER TABLE songs ADD COLUMN stem_count INTEGER DEFAULT 0",
+            # slopsmith#129: per-stem filter needs the id list, not just count.
+            "ALTER TABLE songs ADD COLUMN stem_ids TEXT DEFAULT '[]'",
+            # slopsmith#69 + #22: denormalized canonical tuning name + numeric
+            # sort key (sum of offsets). The existing `tuning` text column
+            # stays — these are caches, repopulated on rescan.
+            "ALTER TABLE songs ADD COLUMN tuning_name TEXT DEFAULT ''",
+            "ALTER TABLE songs ADD COLUMN tuning_sort_key INTEGER DEFAULT 0",
+        ):
+            try:
+                self.conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_songs_artist ON songs(artist COLLATE NOCASE)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_songs_title ON songs(title COLLATE NOCASE)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_songs_tuning_name ON songs(tuning_name COLLATE NOCASE)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_songs_tuning_sort_key ON songs(tuning_sort_key)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_songs_year ON songs(year)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS favorites (filename TEXT PRIMARY KEY)")
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS loops (
@@ -116,7 +129,8 @@ class MetadataDB:
 
     def get(self, filename: str, mtime: float, size: int) -> dict | None:
         row = self.conn.execute(
-            "SELECT mtime, size, title, artist, album, year, duration, tuning, arrangements, has_lyrics, format, stem_count "
+            "SELECT mtime, size, title, artist, album, year, duration, tuning, arrangements, has_lyrics, "
+            "format, stem_count, stem_ids, tuning_name, tuning_sort_key "
             "FROM songs WHERE filename = ?", (filename,)
         ).fetchone()
         if row and row[0] == mtime and row[1] == size and row[2]:
@@ -127,6 +141,9 @@ class MetadataDB:
                 "has_lyrics": bool(row[9]),
                 "format": row[10] or "psarc",
                 "stem_count": int(row[11] or 0),
+                "stem_ids": json.loads(row[12]) if row[12] else [],
+                "tuning_name": row[13] or "",
+                "tuning_sort_key": int(row[14] or 0),
             }
         return None
 
@@ -134,14 +151,18 @@ class MetadataDB:
         with self._lock:
             self.conn.execute(
                 "INSERT OR REPLACE INTO songs "
-                "(filename, mtime, size, title, artist, album, year, duration, tuning, arrangements, has_lyrics, format, stem_count) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(filename, mtime, size, title, artist, album, year, duration, tuning, arrangements, "
+                "has_lyrics, format, stem_count, stem_ids, tuning_name, tuning_sort_key) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (filename, mtime, size, meta.get("title", ""), meta.get("artist", ""),
                  meta.get("album", ""), meta.get("year", ""), meta.get("duration", 0),
                  meta.get("tuning", ""), json.dumps(meta.get("arrangements", [])),
                  1 if meta.get("has_lyrics") else 0,
                  meta.get("format", "psarc"),
-                 int(meta.get("stem_count", 0) or 0)),
+                 int(meta.get("stem_count", 0) or 0),
+                 json.dumps(meta.get("stem_ids", []) or []),
+                 meta.get("tuning_name", "") or "",
+                 int(meta.get("tuning_sort_key", 0) or 0)),
             )
             self.conn.commit()
 
@@ -169,13 +190,32 @@ class MetadataDB:
             originals.add(fname.replace("_EStd_", "_").replace("_DropD_", "_"))
         return originals
 
-    def query_page(self, q: str = "", page: int = 0, size: int = 24,
-                   sort: str = "artist", direction: str = "asc",
-                   favorites_only: bool = False,
-                   format_filter: str = "") -> tuple[list[dict], int]:
-        """Server-side paginated search. Returns (songs, total_count)."""
+    # Manifest-allowed filter values. Whitelisted before binding so a
+    # malformed query string can't push arbitrary text through to SQL —
+    # parameters are bound, but capping the input space is still cheap
+    # defense-in-depth (see slopsmith#129).
+    _ALLOWED_ARRANGEMENT_NAMES = {"Lead", "Rhythm", "Bass", "Combo"}
+    # Stem ids match the bare strings sloppak manifests use today —
+    # `full`, `guitar`, `bass`, `drums`, `vocals`, `piano`, `other`. The
+    # frontend filter UI omits `full` (it's the always-on fallback mix
+    # and would match every sloppak), but the server-side whitelist
+    # keeps it so a hand-rolled API client can still ask for it.
+    _ALLOWED_STEM_IDS = {"full", "guitar", "bass", "drums", "vocals", "piano", "other"}
+
+    def _build_where(self, q: str = "", favorites_only: bool = False,
+                     format_filter: str = "",
+                     arrangements_has: list[str] | None = None,
+                     arrangements_lacks: list[str] | None = None,
+                     stems_has: list[str] | None = None,
+                     stems_lacks: list[str] | None = None,
+                     has_lyrics: int | None = None,
+                     tunings: list[str] | None = None) -> tuple[str, list]:
+        """Shared WHERE-clause builder for query_page / query_artists /
+        query_stats. Returns (where_sql, params). Leading 'WHERE' is
+        included so callers paste it directly. See slopsmith#129/#69.
+        """
         where = "WHERE title != ''"
-        params = []
+        params: list = []
         if favorites_only:
             where += " AND filename IN (SELECT filename FROM favorites)"
         if format_filter:
@@ -184,19 +224,120 @@ class MetadataDB:
         if q:
             where += " AND (title LIKE ? COLLATE NOCASE OR artist LIKE ? COLLATE NOCASE OR album LIKE ? COLLATE NOCASE)"
             params += [f"%{q}%"] * 3
+        # arrangements_has: OR within axis (any-of). Uses JSON1's
+        # json_each which yields one row per arrangement, then matches
+        # the `name` field. The whole subquery is wrapped in EXISTS so
+        # we don't multiply rows in the outer SELECT.
+        arr_has = [a for a in (arrangements_has or []) if a in self._ALLOWED_ARRANGEMENT_NAMES]
+        if arr_has:
+            placeholders = ",".join(["?"] * len(arr_has))
+            where += (" AND EXISTS (SELECT 1 FROM json_each(songs.arrangements) "
+                      f"WHERE json_extract(value, '$.name') IN ({placeholders}))")
+            params += arr_has
+        arr_lacks = [a for a in (arrangements_lacks or []) if a in self._ALLOWED_ARRANGEMENT_NAMES]
+        if arr_lacks:
+            placeholders = ",".join(["?"] * len(arr_lacks))
+            where += (" AND NOT EXISTS (SELECT 1 FROM json_each(songs.arrangements) "
+                      f"WHERE json_extract(value, '$.name') IN ({placeholders}))")
+            params += arr_lacks
+        stems_h = [s for s in (stems_has or []) if s in self._ALLOWED_STEM_IDS]
+        if stems_h:
+            placeholders = ",".join(["?"] * len(stems_h))
+            where += (" AND EXISTS (SELECT 1 FROM json_each(songs.stem_ids) "
+                      f"WHERE value IN ({placeholders}))")
+            params += stems_h
+        stems_l = [s for s in (stems_lacks or []) if s in self._ALLOWED_STEM_IDS]
+        if stems_l:
+            placeholders = ",".join(["?"] * len(stems_l))
+            where += (" AND NOT EXISTS (SELECT 1 FROM json_each(songs.stem_ids) "
+                      f"WHERE value IN ({placeholders}))")
+            params += stems_l
+        if has_lyrics in (0, 1):
+            where += " AND has_lyrics = ?"
+            params.append(has_lyrics)
+        if tunings:
+            # Keep the input cap conservative (32) so a hostile caller
+            # can't blow out the parameter list. Real tuning sets in the
+            # wild number in the low double digits.
+            tn = [t for t in tunings if isinstance(t, str) and t][:32]
+            if tn:
+                placeholders = ",".join(["?"] * len(tn))
+                where += f" AND tuning_name COLLATE NOCASE IN ({placeholders})"
+                params += tn
+        return where, params
+
+    def query_page(self, q: str = "", page: int = 0, size: int = 24,
+                   sort: str = "artist", direction: str = "asc",
+                   favorites_only: bool = False,
+                   format_filter: str = "",
+                   arrangements_has: list[str] | None = None,
+                   arrangements_lacks: list[str] | None = None,
+                   stems_has: list[str] | None = None,
+                   stems_lacks: list[str] | None = None,
+                   has_lyrics: int | None = None,
+                   tunings: list[str] | None = None) -> tuple[list[dict], int]:
+        """Server-side paginated search. Returns (songs, total_count)."""
+        where, params = self._build_where(
+            q=q, favorites_only=favorites_only, format_filter=format_filter,
+            arrangements_has=arrangements_has, arrangements_lacks=arrangements_lacks,
+            stems_has=stems_has, stems_lacks=stems_lacks,
+            has_lyrics=has_lyrics, tunings=tunings,
+        )
 
         sort_map = {
             "artist": "artist COLLATE NOCASE", "artist-desc": "artist COLLATE NOCASE DESC",
             "title": "title COLLATE NOCASE", "title-desc": "title COLLATE NOCASE DESC",
-            "recent": "mtime DESC", "tuning": "tuning COLLATE NOCASE",
+            "recent": "mtime DESC",
+            # Tuning sort uses musical distance from E Standard
+            # (slopsmith#22 — was alphabetical). `tuning_sort_key` is
+            # the sum of per-string offsets, so |sort_key| is the
+            # magnitude of the down/up-tune. ABS ascending puts E
+            # Standard (0) first, then ±2 (Drop D, F Standard), then
+            # ±6 (Eb Standard, F# Standard), and so on. Within a
+            # magnitude tier we break ties by signed key ASC so the
+            # negative (down-tuned) variant comes before the positive
+            # (up-tuned) one — Eb Standard before F Standard, matching
+            # how Rocksmith groups its tuning list. Final tiebreak by
+            # name keeps the order fully deterministic.
+            #
+            # Leading term pushes pre-migration / unscanned rows to
+            # the bottom — without it ABS(0) collides with E
+            # Standard's 0 and unindexed rows would sort first.
+            # COALESCE on every column the clause references guards
+            # against NULL values — SQLite's literal-constant ADD
+            # COLUMN does backfill on most versions, but raw SQL
+            # inserts that bypass `put()`, edge-case migration paths,
+            # or future code that writes None could still leave NULLs
+            # behind, and a NULL `tuning_name` in `(tuning_name = '')`
+            # evaluates to NULL itself (which sorts ahead of 0 in
+            # ASC), defeating the push-to-bottom intent.
+            "tuning": (
+                "(COALESCE(tuning_name, '') = '') ASC, "
+                "ABS(COALESCE(tuning_sort_key, 0)), "
+                "COALESCE(tuning_sort_key, 0) ASC, "
+                "COALESCE(tuning_name, '') COLLATE NOCASE"
+            ),
+            # Year sort (slopsmith#128). Empty-year rows pushed to the
+            # bottom for both directions; otherwise CAST so '2010' >
+            # '2005' rather than alphabetic.
+            "year": "(year = '') ASC, CAST(year AS INTEGER) ASC",
+            "year-desc": "(year = '') ASC, CAST(year AS INTEGER) DESC",
         }
         order = sort_map.get(sort, "artist COLLATE NOCASE")
-        if direction == "desc" and "DESC" not in order:
+        # Legacy `dir=desc` toggle: only safe to append on simple sort
+        # clauses that don't already encode a direction. Compound /
+        # multi-term entries above (tuning, year, year-desc) bake their
+        # ASC/DESC into the clause, so a global ` DESC` append would
+        # produce invalid SQL like `CAST(year AS INTEGER) ASC DESC`.
+        # Skip the append in that case — clients flipping direction on
+        # those sorts use the explicit `-desc` sort key instead.
+        if direction == "desc" and " ASC" not in order and " DESC" not in order:
             order += " DESC"
 
         total = self.conn.execute(f"SELECT COUNT(*) FROM songs {where}", params).fetchone()[0]
         rows = self.conn.execute(
-            f"SELECT filename, title, artist, album, year, duration, tuning, arrangements, has_lyrics, mtime, format, stem_count "
+            f"SELECT filename, title, artist, album, year, duration, tuning, arrangements, has_lyrics, mtime, "
+            f"format, stem_count, stem_ids, tuning_name "
             f"FROM songs {where} ORDER BY {order} LIMIT ? OFFSET ?",
             params + [size, page * size]
         ).fetchall()
@@ -212,6 +353,8 @@ class MetadataDB:
                 "has_lyrics": bool(r[8]), "mtime": r[9],
                 "format": r[10] or "psarc",
                 "stem_count": int(r[11] or 0),
+                "stem_ids": json.loads(r[12]) if r[12] else [],
+                "tuning_name": r[13] or "",
                 "has_estd": r[0] in estd, "favorite": r[0] in favs,
             })
         return songs, total
@@ -219,23 +362,25 @@ class MetadataDB:
     def query_artists(self, letter: str = "", q: str = "",
                       favorites_only: bool = False,
                       page: int = 0, size: int = 50,
-                      format_filter: str = "") -> tuple[list[dict], int]:
+                      format_filter: str = "",
+                      arrangements_has: list[str] | None = None,
+                      arrangements_lacks: list[str] | None = None,
+                      stems_has: list[str] | None = None,
+                      stems_lacks: list[str] | None = None,
+                      has_lyrics: int | None = None,
+                      tunings: list[str] | None = None) -> tuple[list[dict], int]:
         """Get artists grouped by letter with their albums and songs. Returns (artists, total_artists)."""
-        where = "WHERE title != ''"
-        params = []
-        if favorites_only:
-            where += " AND filename IN (SELECT filename FROM favorites)"
-        if format_filter:
-            where += " AND format = ?"
-            params.append(format_filter)
+        where, params = self._build_where(
+            q=q, favorites_only=favorites_only, format_filter=format_filter,
+            arrangements_has=arrangements_has, arrangements_lacks=arrangements_lacks,
+            stems_has=stems_has, stems_lacks=stems_lacks,
+            has_lyrics=has_lyrics, tunings=tunings,
+        )
         if letter == "#":
             where += " AND artist NOT GLOB '[A-Za-z]*'"
         elif letter:
             where += " AND UPPER(SUBSTR(artist, 1, 1)) = ?"
             params.append(letter.upper())
-        if q:
-            where += " AND (title LIKE ? COLLATE NOCASE OR artist LIKE ? COLLATE NOCASE OR album LIKE ? COLLATE NOCASE)"
-            params += [f"%{q}%"] * 3
 
         # Get paginated distinct artists
         total_artists = self.conn.execute(
@@ -257,7 +402,8 @@ class MetadataDB:
         song_params = params + artist_names
 
         rows = self.conn.execute(
-            f"SELECT filename, title, artist, album, year, duration, tuning, arrangements, has_lyrics, format, stem_count "
+            f"SELECT filename, title, artist, album, year, duration, tuning, arrangements, has_lyrics, "
+            f"format, stem_count, stem_ids, tuning_name "
             f"FROM songs {song_where} ORDER BY artist COLLATE NOCASE, album COLLATE NOCASE, title COLLATE NOCASE",
             song_params
         ).fetchall()
@@ -283,6 +429,8 @@ class MetadataDB:
                 "has_lyrics": bool(r[8]),
                 "format": r[9] or "psarc",
                 "stem_count": int(r[10] or 0),
+                "stem_ids": json.loads(r[11]) if r[11] else [],
+                "tuning_name": r[12] or "",
                 "has_estd": r[0] in estd,
                 "favorite": r[0] in favs,
             })
@@ -297,14 +445,35 @@ class MetadataDB:
                            "song_count": sum(len(a["songs"]) for a in albums), "albums": albums})
         return result, total_artists
 
-    def query_stats(self, favorites_only: bool = False) -> dict:
-        """Aggregate stats for the letter bar."""
-        filt = " AND filename IN (SELECT filename FROM favorites)" if favorites_only else ""
-        total = self.conn.execute(f"SELECT COUNT(*) FROM songs WHERE title != ''{filt}").fetchone()[0]
-        artist_count = self.conn.execute(f"SELECT COUNT(DISTINCT artist) FROM songs WHERE title != ''{filt}").fetchone()[0]
+    def query_stats(self, favorites_only: bool = False,
+                    q: str = "", format_filter: str = "",
+                    arrangements_has: list[str] | None = None,
+                    arrangements_lacks: list[str] | None = None,
+                    stems_has: list[str] | None = None,
+                    stems_lacks: list[str] | None = None,
+                    has_lyrics: int | None = None,
+                    tunings: list[str] | None = None) -> dict:
+        """Aggregate stats for the letter bar. Accepts the same filter
+        params as query_page so the letter counts stay synchronized
+        with the grid when filters are active."""
+        where, params = self._build_where(
+            q=q, favorites_only=favorites_only, format_filter=format_filter,
+            arrangements_has=arrangements_has, arrangements_lacks=arrangements_lacks,
+            stems_has=stems_has, stems_lacks=stems_lacks,
+            has_lyrics=has_lyrics, tunings=tunings,
+        )
+        total = self.conn.execute(f"SELECT COUNT(*) FROM songs {where}", params).fetchone()[0]
+        # NOCASE collation here mirrors `query_artists` and the per-
+        # letter `COUNT(DISTINCT artist COLLATE NOCASE)` below — without
+        # it, an artist stored under two different casings would inflate
+        # `total_artists` against the letter-bar breakdown the UI
+        # renders next to it.
+        artist_count = self.conn.execute(
+            f"SELECT COUNT(DISTINCT artist COLLATE NOCASE) FROM songs {where}", params
+        ).fetchone()[0]
         rows = self.conn.execute(
             f"SELECT UPPER(SUBSTR(artist, 1, 1)) as letter, COUNT(DISTINCT artist COLLATE NOCASE) "
-            f"FROM songs WHERE title != ''{filt} GROUP BY letter"
+            f"FROM songs {where} GROUP BY letter", params
         ).fetchall()
         letters = {}
         for letter, count in rows:
@@ -348,6 +517,10 @@ def _extract_meta_fast(psarc_path: Path) -> dict:
     title = artist = album = year = ""
     duration = 0.0
     tuning = "E Standard"
+    # Track the offsets for the tuning we ultimately keep so we can
+    # compute tuning_sort_key (#22) without re-deriving it from the
+    # name. Defaults to E Standard offsets.
+    tuning_offsets: list[int] = [0] * 6
     _tuning_from_guitar = False
     arrangements = []
     has_lyrics = False
@@ -384,6 +557,7 @@ def _extract_meta_fast(psarc_path: Path) -> dict:
                         is_guitar = arr_name in ("Lead", "Rhythm", "Combo")
                         if tuning == "E Standard" or (is_guitar and not _tuning_from_guitar):
                             tuning = tun_name
+                            tuning_offsets = offsets
                             if is_guitar:
                                 _tuning_from_guitar = True
                     notes = attrs.get("NotesHard", 0) or attrs.get("NotesMedium", 0) or 0
@@ -416,6 +590,14 @@ def _extract_meta_fast(psarc_path: Path) -> dict:
         "title": title, "artist": artist, "album": album, "year": year,
         "duration": duration, "tuning": tuning,
         "arrangements": arrangements, "has_lyrics": has_lyrics,
+        # PSARCs have no stems; emit an empty list so the column round-
+        # trips uniformly with sloppaks (slopsmith#129).
+        "stem_ids": [],
+        # Cached tuning fields (slopsmith#22 / #69). The text `tuning`
+        # column above stays the source of truth for display; these are
+        # the indexable / filterable forms.
+        "tuning_name": tuning,
+        "tuning_sort_key": sum(tuning_offsets),
     }
 
 
@@ -423,8 +605,14 @@ def _extract_meta_sloppak(path: Path) -> dict:
     """Extract metadata for a sloppak (file or directory)."""
     meta = sloppak_mod.extract_meta(path)
     offsets = meta.pop("tuning_offsets", None) or [0] * 6
-    meta["tuning"] = tuning_name(offsets)
+    name = tuning_name(offsets)
+    meta["tuning"] = name
+    meta["tuning_name"] = name
+    meta["tuning_sort_key"] = sum(offsets)
     meta["format"] = "sloppak"
+    # `extract_meta` already populates `stem_ids` (slopsmith#129);
+    # default to empty for older callers / mocks.
+    meta.setdefault("stem_ids", [])
     return meta
 
 
@@ -444,8 +632,10 @@ def _extract_meta_for_file(psarc_path: Path) -> dict:
         unpack_psarc(str(psarc_path), tmp)
         song = load_song(tmp)
         tuning = "E Standard"
+        tuning_offsets: list[int] = [0] * 6
         if song.arrangements and song.arrangements[0].tuning:
-            tuning = tuning_name(song.arrangements[0].tuning)
+            tuning_offsets = list(song.arrangements[0].tuning)
+            tuning = tuning_name(tuning_offsets)
         arrangements = [
             {"index": i, "name": a.name,
              "notes": len(a.notes) + sum(len(c.notes) for c in a.chords)}
@@ -464,6 +654,9 @@ def _extract_meta_for_file(psarc_path: Path) -> dict:
             "album": song.album, "year": str(song.year) if song.year else "",
             "duration": song.song_length, "tuning": tuning,
             "arrangements": arrangements, "has_lyrics": has_lyrics,
+            "stem_ids": [],
+            "tuning_name": tuning,
+            "tuning_sort_key": sum(tuning_offsets),
         }
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -652,32 +845,117 @@ def trigger_full_rescan():
 
 # ── Library API ───────────────────────────────────────────────────────────────
 
+def _split_csv(raw: str) -> list[str]:
+    """Parse a comma-separated query-string list. Empty / whitespace-only
+    entries are dropped so `arrangements_has=` (no value) and
+    `arrangements_has=,` both mean 'no filter'."""
+    if not raw:
+        return []
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+def _parse_has_lyrics(raw: str) -> int | None:
+    """Tri-state parse for has_lyrics. `1` → require, `0` → exclude,
+    anything else (including empty) → no filter."""
+    if raw == "1":
+        return 1
+    if raw == "0":
+        return 0
+    return None
+
+
 @app.get("/api/library")
 def list_library(q: str = "", page: int = 0, size: int = 24, sort: str = "artist",
-                 dir: str = "asc", favorites: int = 0, format: str = ""):
+                 dir: str = "asc", favorites: int = 0, format: str = "",
+                 arrangements_has: str = "", arrangements_lacks: str = "",
+                 stems_has: str = "", stems_lacks: str = "",
+                 has_lyrics: str = "", tunings: str = ""):
     """Paginated library search, queried from SQLite."""
     size = min(size, 100)
     fmt = format if format in ("psarc", "sloppak") else ""
-    songs, total = meta_db.query_page(q=q, page=page, size=size, sort=sort,
-                                       direction=dir, favorites_only=bool(favorites),
-                                       format_filter=fmt)
+    songs, total = meta_db.query_page(
+        q=q, page=page, size=size, sort=sort,
+        direction=dir, favorites_only=bool(favorites), format_filter=fmt,
+        arrangements_has=_split_csv(arrangements_has),
+        arrangements_lacks=_split_csv(arrangements_lacks),
+        stems_has=_split_csv(stems_has),
+        stems_lacks=_split_csv(stems_lacks),
+        has_lyrics=_parse_has_lyrics(has_lyrics),
+        tunings=_split_csv(tunings),
+    )
     return {"songs": songs, "total": total, "page": page, "size": size}
 
 
 @app.get("/api/library/artists")
 def list_artists(letter: str = "", q: str = "", favorites: int = 0, page: int = 0, size: int = 50,
-                 format: str = ""):
+                 format: str = "",
+                 arrangements_has: str = "", arrangements_lacks: str = "",
+                 stems_has: str = "", stems_lacks: str = "",
+                 has_lyrics: str = "", tunings: str = ""):
     """Get artists grouped by letter with albums and songs (for tree view)."""
     fmt = format if format in ("psarc", "sloppak") else ""
-    artists, total = meta_db.query_artists(letter=letter, q=q, favorites_only=bool(favorites),
-                                           page=page, size=min(size, 100), format_filter=fmt)
+    artists, total = meta_db.query_artists(
+        letter=letter, q=q, favorites_only=bool(favorites),
+        page=page, size=min(size, 100), format_filter=fmt,
+        arrangements_has=_split_csv(arrangements_has),
+        arrangements_lacks=_split_csv(arrangements_lacks),
+        stems_has=_split_csv(stems_has),
+        stems_lacks=_split_csv(stems_lacks),
+        has_lyrics=_parse_has_lyrics(has_lyrics),
+        tunings=_split_csv(tunings),
+    )
     return {"artists": artists, "total_artists": total, "page": page, "size": size}
 
 
 @app.get("/api/library/stats")
-def library_stats(favorites: int = 0):
-    """Aggregate stats for the UI."""
-    return meta_db.query_stats(favorites_only=bool(favorites))
+def library_stats(favorites: int = 0, q: str = "", format: str = "",
+                  arrangements_has: str = "", arrangements_lacks: str = "",
+                  stems_has: str = "", stems_lacks: str = "",
+                  has_lyrics: str = "", tunings: str = ""):
+    """Aggregate stats for the UI. Accepts the same filter params as
+    /api/library so the letter bar mirrors the active grid filter set."""
+    fmt = format if format in ("psarc", "sloppak") else ""
+    return meta_db.query_stats(
+        favorites_only=bool(favorites), q=q, format_filter=fmt,
+        arrangements_has=_split_csv(arrangements_has),
+        arrangements_lacks=_split_csv(arrangements_lacks),
+        stems_has=_split_csv(stems_has),
+        stems_lacks=_split_csv(stems_lacks),
+        has_lyrics=_parse_has_lyrics(has_lyrics),
+        tunings=_split_csv(tunings),
+    )
+
+
+@app.get("/api/library/tuning-names")
+def list_tuning_names():
+    """Distinct tuning names present in the library, with per-tuning
+    counts. Powers the tuning multi-select. Sorted by `tuning_sort_key`
+    so names appear in the same musical order the sort uses
+    (slopsmith#22) — E Standard first, then nearest neighbors."""
+    rows = meta_db.conn.execute(
+        "SELECT tuning_name, MIN(tuning_sort_key), COUNT(*) "
+        # NULL/empty-name rows are excluded entirely from the picker —
+        # users can't usefully filter by an unknown tuning. Once they
+        # rescan, the rows acquire a name and join the list.
+        "FROM songs WHERE title != '' AND COALESCE(tuning_name, '') != '' "
+        "GROUP BY tuning_name COLLATE NOCASE "
+        # Same ordering as `sort=tuning` in `query_page`: distance
+        # from E Standard first, then signed-key ASC so the down-
+        # tuned variant precedes the up-tuned one at equal distance
+        # (Eb Standard before F Standard at distance 6). Final
+        # alphabetical tiebreak keeps the order deterministic.
+        # COALESCE around the sort_key guards against NULL the same
+        # way the main tuning sort does.
+        "ORDER BY ABS(COALESCE(MIN(tuning_sort_key), 0)), "
+        "COALESCE(MIN(tuning_sort_key), 0) ASC, "
+        "tuning_name COLLATE NOCASE"
+    ).fetchall()
+    return {
+        "tunings": [
+            {"name": name, "sort_key": int(sk or 0), "count": count}
+            for name, sk, count in rows
+        ],
+    }
 
 
 @app.post("/api/favorites/toggle")
