@@ -18,7 +18,48 @@ function showScreen(id) {
 }
 
 // ── Library ──────────────────────────────────────────────────────────────
-let libView = 'grid';
+
+// Persist the view toggle (grid vs tree), sort selection, and format
+// filter across reloads. Stored as separate keys (rather than one
+// blob) so future controls can opt in independently and a corrupted
+// single value doesn't wipe the rest. Validation lives at the read
+// site — we coerce unknown values back to safe defaults rather than
+// trusting whatever happens to be in localStorage.
+const _LIB_VIEW_KEY = 'slopsmith.libView';
+const _LIB_SORT_KEY = 'slopsmith.libSort';
+const _LIB_FORMAT_KEY = 'slopsmith.libFormat';
+const _LIB_VIEW_VALUES = new Set(['grid', 'tree']);
+const _LIB_SORT_VALUES = new Set([
+    'artist', 'artist-desc', 'title', 'title-desc',
+    'recent', 'year-desc', 'year', 'tuning',
+]);
+const _LIB_FORMAT_VALUES = new Set(['', 'psarc', 'sloppak']);
+// Tree-view expand/collapse persistence. Three states per tree:
+//   '1'  → user asked to expand all
+//   '0'  → user asked to collapse all
+//   null → no explicit choice; renderTreeInto's existing heuristic
+//          (auto-open when search active or few artists) wins
+//
+// Library and Favorites are separate trees with separate
+// Expand/Collapse buttons, so each gets its own key — toggling one
+// must not flip the other's persisted state.
+const _LIB_TREE_EXPAND_KEY = 'slopsmith.libTreeExpand';
+const _FAV_TREE_EXPAND_KEY = 'slopsmith.favTreeExpand';
+const _LIB_TREE_EXPAND_VALUES = new Set(['1', '0']);
+
+function _readPersistedChoice(key, allowed, fallback) {
+    try {
+        const v = localStorage.getItem(key);
+        return v !== null && allowed.has(v) ? v : fallback;
+    } catch {
+        return fallback;
+    }
+}
+function _writePersistedChoice(key, value) {
+    try { localStorage.setItem(key, value); } catch { /* private mode / quota */ }
+}
+
+let libView = _readPersistedChoice(_LIB_VIEW_KEY, _LIB_VIEW_VALUES, 'grid');
 let currentPage = 0;
 const PAGE_SIZE = 24;
 let _treeLetter = '';
@@ -357,6 +398,7 @@ function clearLibFilters() {
 
 function setLibView(view) {
     libView = view;
+    if (_LIB_VIEW_VALUES.has(view)) _writePersistedChoice(_LIB_VIEW_KEY, view);
     document.getElementById('lib-grid').classList.toggle('hidden', view !== 'grid');
     document.getElementById('lib-tree').classList.toggle('hidden', view !== 'tree');
     document.querySelectorAll('.lib-grid-ctrl').forEach(el => el.classList.toggle('hidden', view !== 'grid'));
@@ -392,6 +434,18 @@ function filterLibrary() {
 }
 
 function sortLibrary() {
+    // Persist whichever of the two dropdowns just changed so the next
+    // page load can restore both. Both selects route through this
+    // handler today; reading both is cheap and keeps the function
+    // single-purpose.
+    const sortEl = document.getElementById('lib-sort');
+    if (sortEl && _LIB_SORT_VALUES.has(sortEl.value)) {
+        _writePersistedChoice(_LIB_SORT_KEY, sortEl.value);
+    }
+    const fmtEl = document.getElementById('lib-format');
+    if (fmtEl && _LIB_FORMAT_VALUES.has(fmtEl.value)) {
+        _writePersistedChoice(_LIB_FORMAT_KEY, fmtEl.value);
+    }
     _libEpoch++;
     currentPage = 0;
     // Same reason as filterLibrary: format dropdown changes the stats
@@ -601,8 +655,22 @@ async function renderTreeInto(containerId, countId, stats, letter, q, favoritesO
     document.getElementById(countId).textContent =
         `${totalArtists} artists (${songCount} songs on this page)${pageInfo}`;
 
+    // A previous Expand/Collapse-All click is persisted as '1'/'0' and
+    // overrides the auto-open heuristic for both artists and albums.
+    // Library and Favorites have independent buttons and independent
+    // keys (slopsmith.libTreeExpand vs slopsmith.favTreeExpand) — fed
+    // off the favoritesOnly flag — so toggling one doesn't flip the
+    // other's state. Falsy / unset key → fall back to the existing
+    // heuristic (open when there's an active search or few rows).
+    const expandKey = favoritesOnly ? _FAV_TREE_EXPAND_KEY : _LIB_TREE_EXPAND_KEY;
+    const savedExpand = _readPersistedChoice(expandKey, _LIB_TREE_EXPAND_VALUES, null);
+    const forceArtistOpen = savedExpand === '1';
+    const forceArtistClosed = savedExpand === '0';
+
     for (const artist of artists) {
-        const openClass = q || artists.length <= 5 ? ' open' : '';
+        const heuristicOpen = q || artists.length <= 5;
+        const isOpen = forceArtistOpen ? true : forceArtistClosed ? false : heuristicOpen;
+        const openClass = isOpen ? ' open' : '';
         html += `<div class="artist-row${openClass}">`;
         html += `<div class="artist-header" onclick="this.parentElement.classList.toggle('open')">`;
         html += chevron;
@@ -612,7 +680,9 @@ async function renderTreeInto(containerId, countId, stats, letter, q, favoritesO
 
         for (const album of artist.albums) {
             const artUrl = `/api/song/${encodeURIComponent(album.songs[0].filename)}/art${album.songs[0].mtime ? `?v=${Math.floor(album.songs[0].mtime)}` : ''}`;
-            const albumOpen = q || artist.albums.length === 1 ? ' open' : '';
+            const albumHeuristicOpen = q || artist.albums.length === 1;
+            const albumIsOpen = forceArtistOpen ? true : forceArtistClosed ? false : albumHeuristicOpen;
+            const albumOpen = albumIsOpen ? ' open' : '';
             html += `<div class="album-group${albumOpen}">`;
             html += `<div class="album-header" onclick="this.parentElement.classList.toggle('open')">`;
             html += chevron;
@@ -690,9 +760,27 @@ function filterTreeLetter(letter) {
     loadTreeView();
 }
 
+function _toggleAllInTree(containerId, expand, persistKey) {
+    // Scope the open/close to the named tree's container so toggling
+    // Library doesn't flip the (offscreen) Favorites DOM and vice
+    // versa — they share `.artist-row` / `.album-group` classes.
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    container.querySelectorAll('.artist-row').forEach(el => el.classList.toggle('open', expand));
+    container.querySelectorAll('.album-group').forEach(el => el.classList.toggle('open', expand));
+    // Persist the explicit choice so the next page reload (or letter
+    // change, which re-runs renderTreeInto) honors it instead of
+    // falling back to the auto-open heuristic. Stored as '1'/'0' so a
+    // missing key reliably means "no explicit choice".
+    _writePersistedChoice(persistKey, expand ? '1' : '0');
+}
+
 function toggleAllArtists(expand) {
-    document.querySelectorAll('.artist-row').forEach(el => el.classList.toggle('open', expand));
-    document.querySelectorAll('.album-group').forEach(el => el.classList.toggle('open', expand));
+    _toggleAllInTree('lib-tree', expand, _LIB_TREE_EXPAND_KEY);
+}
+
+function toggleAllFavoriteArtists(expand) {
+    _toggleAllInTree('fav-tree', expand, _FAV_TREE_EXPAND_KEY);
 }
 
 function esc(s) {
@@ -2302,7 +2390,22 @@ loadPlugins().then(async (plugins) => {
     // (slopsmith#129).
     _renderLibFilterChips();
     _updateLibFiltersBadge();
-    setLibView('grid');
+    // Restore the persisted sort and format-filter dropdowns BEFORE
+    // the first setLibView() call — setLibView triggers loadLibrary,
+    // which reads `lib-sort` / `lib-format` to build the API query
+    // string. Without this, the first page would always load with
+    // "Artist A-Z" / "All formats" regardless of what the user had
+    // picked previously.
+    const savedSort = _readPersistedChoice(_LIB_SORT_KEY, _LIB_SORT_VALUES, 'artist');
+    const savedFormat = _readPersistedChoice(_LIB_FORMAT_KEY, _LIB_FORMAT_VALUES, '');
+    const sortEl = document.getElementById('lib-sort');
+    const fmtEl = document.getElementById('lib-format');
+    if (sortEl) sortEl.value = savedSort;
+    if (fmtEl) fmtEl.value = savedFormat;
+    // `libView` was already initialized from localStorage at module
+    // load; passing it through setLibView replays the visibility
+    // toggling and triggers the initial load.
+    setLibView(libView);
     try { await loadSettings(); } catch (e) { console.warn('initial loadSettings failed:', e); }
     checkScanAndLoad();
     // Viz picker depends on plugin scripts having loaded (to find
