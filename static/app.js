@@ -2228,6 +2228,7 @@ async function checkScanAndLoad() {
 
 // ── Plugin loader ───────────────────────────────────────────────────────
 function setPluginLoadingState(loading, message) {
+    console.log('[slopsmith] setPluginLoadingState', loading, message, new Error().stack.split('\n')[2]);
     const navContainer = document.getElementById('nav-plugins');
     const mobileNavContainer = document.getElementById('mobile-nav-plugins');
     const settingsArea = document.getElementById('plugin-settings-area');
@@ -2286,8 +2287,9 @@ async function waitForPluginStartupComplete(timeoutMs = 180000) {
 let _loadPluginsInFlight = false;
 
 async function loadPlugins() {
-    if (_loadPluginsInFlight) return null;
+    if (_loadPluginsInFlight) { console.log('[slopsmith] loadPlugins: in-flight, skipping'); return null; }
     _loadPluginsInFlight = true;
+    console.log('[slopsmith] loadPlugins: start');
     let plugins;
     const navContainer = document.getElementById('nav-plugins');
     const mobileNavContainer = document.getElementById('mobile-nav-plugins');
@@ -2297,6 +2299,7 @@ async function loadPlugins() {
     try {
         const resp = await fetch('/api/plugins');
         plugins = await resp.json();
+        console.log('[slopsmith] loadPlugins: got', plugins.length, 'plugins');
 
         const settingsContainer = document.getElementById('plugin-settings');
 
