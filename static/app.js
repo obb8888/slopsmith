@@ -2289,12 +2289,15 @@ async function loadPlugins() {
     if (_loadPluginsInFlight) return null;
     _loadPluginsInFlight = true;
     let plugins;
+    const navContainer = document.getElementById('nav-plugins');
+    const mobileNavContainer = document.getElementById('mobile-nav-plugins');
+    // Snapshot current nav so we can restore it if the fetch fails.
+    const _savedNav = navContainer ? navContainer.innerHTML : null;
+    const _savedMobileNav = mobileNavContainer ? mobileNavContainer.innerHTML : null;
     try {
         const resp = await fetch('/api/plugins');
         plugins = await resp.json();
 
-        const navContainer = document.getElementById('nav-plugins');
-        const mobileNavContainer = document.getElementById('mobile-nav-plugins');
         const settingsContainer = document.getElementById('plugin-settings');
 
         // One-shot hydration guard: always clear plugin-owned containers first.
@@ -2444,6 +2447,9 @@ async function loadPlugins() {
         }
     } catch (e) {
         console.error('Failed to load plugins:', e);
+        // Restore nav so a failed re-hydration call doesn't leave it blank.
+        if (_savedNav !== null && navContainer) navContainer.innerHTML = _savedNav;
+        if (_savedMobileNav !== null && mobileNavContainer) mobileNavContainer.innerHTML = _savedMobileNav;
         _loadPluginsInFlight = false;
         return null;
     }
