@@ -202,6 +202,43 @@ def _warn_on_module_collisions(plugin_specs):
         )
 
 
+def _is_safe_tour_manifest_filename(val) -> bool:
+    """Return True only for non-empty relative tour manifest filenames.
+
+    The filename must not be absolute, must not contain backslashes, must
+    not contain any ``..`` path segment, and must not be a bare ``.`` (which
+    would resolve to the plugin directory itself) so ``has_tour`` only
+    advertises files that are eligible to be served by the route handler.
+    """
+    if not isinstance(val, str) or not val:
+        return False
+    if "\\" in val or os.path.isabs(val):
+        return False
+    p = Path(val)
+    if ".." in p.parts:
+        return False
+    # Reject "." and any path whose final component is "." (e.g. "./").
+    return p.name != '.'
+
+
+def _is_valid_tour_manifest(val) -> bool:
+    """Return True only when the tour manifest field is a usable string
+    filename or a dict.  A dict without a ``file`` key is valid — the route
+    handler defaults it to ``"tour.json"``.  A dict that explicitly sets
+    ``file`` must use a non-empty safe relative string (``file: null``,
+    ``file: 1``, ``file: "../x.json"``, absolute paths, etc. are rejected).
+    Empty strings, non-string scalars (e.g. ``true``, ``1``), and dicts with
+    an explicitly invalid ``file`` value are treated as absent.
+    """
+    if isinstance(val, str):
+        return _is_safe_tour_manifest_filename(val)
+    if isinstance(val, dict):
+        if "file" not in val:
+            return True  # no file key → defaults to "tour.json" in the route
+        return _is_safe_tour_manifest_filename(val["file"])
+    return False
+
+
 def _normalize_export_paths(settings_field, plugin_id: str) -> list[str]:
     """Validate and normalize a plugin's `settings.server_files` manifest
     list into clean POSIX-style relpaths suitable for the settings
@@ -578,6 +615,7 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
             "has_screen": bool(manifest.get("screen")),
             "has_script": bool(manifest.get("script")),
             "has_settings": bool(manifest.get("settings")),
+            "has_tour": _is_valid_tour_manifest(manifest.get("tour")),
             # Normalized list of relpaths under CONFIG_DIR that this
             # plugin opts in to settings export/import. Empty for
             # plugins that don't declare `settings.server_files`. See
@@ -665,6 +703,7 @@ def register_plugin_api(app: FastAPI):
                 "has_screen": p["has_screen"],
                 "has_script": p["has_script"],
                 "has_settings": p["has_settings"],
+                "has_tour": p.get("has_tour", False),
             }
             for p in snapshot
         ]
@@ -752,3 +791,44 @@ def register_plugin_api(app: FastAPI):
                 if settings_file.exists():
                     return HTMLResponse(settings_file.read_text())
         return HTMLResponse("", status_code=404)
+
+    @app.get("/api/plugins/{plugin_id}/tour.json")
+    def plugin_tour_json(plugin_id: str):
+        with PLUGINS_LOCK:
+            snapshot = list(LOADED_PLUGINS)
+        for p in snapshot:
+            if p["id"] == plugin_id:
+                tour_val = p["_manifest"].get("tour")
+                if not _is_valid_tour_manifest(tour_val):
+                    break
+                if isinstance(tour_val, str):
+                    tour_filename = tour_val
+                elif isinstance(tour_val, dict):
+                    tour_filename = tour_val.get("file", "tour.json")
+                else:
+                    break  # shouldn't reach here; _is_valid_tour_manifest guards above
+                # Quick pre-filter for obvious bad paths. This is not the
+                # authoritative security boundary — the resolve+relative_to
+                # check below is — but catching simple cases early produces
+                # a cleaner log message before the filesystem calls.
+                if (
+                    not isinstance(tour_filename, str)
+                    or not tour_filename
+                    or ".." in tour_filename.split("/")
+                    or tour_filename.startswith("/")
+                    or "\\" in tour_filename
+                ):
+                    print(f"[Plugin] {plugin_id}: invalid tour path rejected: {tour_filename!r}")
+                    break
+                tour_file = (p["_dir"] / tour_filename).resolve()
+                plugin_dir = p["_dir"].resolve()
+                # Ensure resolved path stays inside the plugin directory
+                try:
+                    tour_file.relative_to(plugin_dir)
+                except ValueError:
+                    print(f"[Plugin] {plugin_id}: tour path escapes plugin dir: {tour_filename!r}")
+                    break
+                if tour_file.is_file():
+                    return Response(tour_file.read_text(encoding="utf-8"), media_type="application/json")
+                break
+        return Response("{}", status_code=404, media_type="application/json")

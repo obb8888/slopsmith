@@ -17,6 +17,8 @@ import json
 import sys
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 
 # Bare module names that this test module pre-populates into
@@ -879,3 +881,237 @@ def test_progress_cb_emits_plugin_error_on_requirements_failure(tmp_path, reset_
     assert all(e["error"] for e in error_events), "plugin-error events must carry a non-empty error field"
     # Loading continued: req_fail is still registered.
     assert any(p["id"] == "req_fail" for p in plugins.LOADED_PLUGINS)
+
+
+# ── Tour API tests ─────────────────────────────────────────────────────────────
+
+def _make_tour_plugin(plugin_root, plugin_id, *, tour_file_name="tour.json", tour_content=None):
+    """Create a minimal plugin directory with a tour field in plugin.json."""
+    plugin_dir = plugin_root / plugin_id
+    plugin_dir.mkdir(parents=True)
+    manifest = {"id": plugin_id, "name": plugin_id, "tour": tour_file_name}
+    (plugin_dir / "plugin.json").write_text(json.dumps(manifest))
+    if tour_content is not None:
+        (plugin_dir / tour_file_name).write_text(json.dumps(tour_content))
+    return plugin_dir
+
+
+def _make_api_client(plugins):
+    """Register the plugin API on a fresh FastAPI app and return a TestClient."""
+    app = FastAPI()
+    plugins.register_plugin_api(app)
+    return TestClient(app)
+
+
+@pytest.fixture()
+def tour_client(tmp_path, reset_plugin_state):
+    """A TestClient with two plugins: one with a tour, one without."""
+    plugins = reset_plugin_state
+
+    # Plugin with tour
+    tour_content = {"tour": [{"id": "step1", "title": "Hello", "content": "World"}]}
+    plugin_dir = _make_tour_plugin(tmp_path, "with_tour", tour_content=tour_content)
+
+    # Plugin without tour
+    no_tour_dir = tmp_path / "no_tour"
+    no_tour_dir.mkdir()
+    (no_tour_dir / "plugin.json").write_text(json.dumps({"id": "no_tour", "name": "No Tour"}))
+
+    # Stub LOADED_PLUGINS with both plugins
+    plugins.LOADED_PLUGINS.append({
+        "id": "with_tour",
+        "name": "With Tour",
+        "nav": None,
+        "type": None,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": False,
+        "has_tour": True,
+        "_dir": plugin_dir,
+        "_manifest": {"tour": "tour.json"},
+    })
+    plugins.LOADED_PLUGINS.append({
+        "id": "no_tour",
+        "name": "No Tour",
+        "nav": None,
+        "type": None,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": False,
+        "has_tour": False,
+        "_dir": no_tour_dir,
+        "_manifest": {},
+    })
+
+    client = _make_api_client(plugins)
+    try:
+        yield client, plugin_dir
+    finally:
+        client.close()
+
+
+def test_list_plugins_includes_has_tour(tour_client):
+    """GET /api/plugins must include a has_tour boolean for each plugin."""
+    client, _ = tour_client
+    r = client.get("/api/plugins")
+    assert r.status_code == 200
+    plugins_list = r.json()
+    ids = {p["id"]: p for p in plugins_list}
+    assert "has_tour" in ids["with_tour"]
+    assert ids["with_tour"]["has_tour"] is True
+    assert "has_tour" in ids["no_tour"]
+    assert ids["no_tour"]["has_tour"] is False
+
+
+def test_tour_json_serves_file(tour_client):
+    """GET /api/plugins/{id}/tour.json returns file content as JSON for a plugin with a tour."""
+    client, _ = tour_client
+    r = client.get("/api/plugins/with_tour/tour.json")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/json")
+    data = r.json()
+    assert "tour" in data
+    assert data["tour"][0]["id"] == "step1"
+
+
+def test_tour_json_returns_404_for_missing_plugin(tour_client):
+    """GET /api/plugins/{id}/tour.json returns 404 JSON for an unknown plugin."""
+    client, _ = tour_client
+    r = client.get("/api/plugins/nonexistent/tour.json")
+    assert r.status_code == 404
+    assert r.headers["content-type"].startswith("application/json")
+
+
+def test_tour_json_returns_404_for_plugin_without_tour(tour_client):
+    """GET /api/plugins/{id}/tour.json returns 404 for a plugin with no tour manifest entry."""
+    client, _ = tour_client
+    r = client.get("/api/plugins/no_tour/tour.json")
+    assert r.status_code == 404
+    assert r.headers["content-type"].startswith("application/json")
+
+
+def test_tour_json_rejects_path_traversal(tmp_path, reset_plugin_state):
+    """tour field with `../` path traversal must be rejected (returns 404)."""
+    plugins = reset_plugin_state
+    plugin_dir = tmp_path / "evil_plugin"
+    plugin_dir.mkdir()
+    # Write a 'secret' file outside the plugin dir that the traversal targets
+    (tmp_path / "secret.json").write_text(json.dumps({"secret": "data"}))
+    plugins.LOADED_PLUGINS.append({
+        "id": "evil_plugin",
+        "name": "Evil Plugin",
+        "nav": None,
+        "type": None,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": False,
+        "has_tour": True,
+        "_dir": plugin_dir,
+        "_manifest": {"tour": "../secret.json"},
+    })
+    app = FastAPI()
+    plugins.register_plugin_api(app)
+    client = TestClient(app)
+    try:
+        r = client.get("/api/plugins/evil_plugin/tour.json")
+        assert r.status_code == 404
+    finally:
+        client.close()
+
+
+def test_tour_json_handles_non_string_tour_manifest(tmp_path, reset_plugin_state):
+    """A plugin whose `tour` manifest field is truthy but not a string or dict
+    (e.g. ``true``, ``1``) must return 404 without raising AttributeError."""
+    plugins = reset_plugin_state
+    plugin_dir = tmp_path / "bool_tour_plugin"
+    plugin_dir.mkdir()
+    plugins.LOADED_PLUGINS.append({
+        "id": "bool_tour_plugin",
+        "name": "Bool Tour Plugin",
+        "nav": None,
+        "type": None,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": False,
+        "has_tour": False,  # _is_valid_tour_manifest(True) → False
+        "_dir": plugin_dir,
+        "_manifest": {"tour": True},  # boolean true in manifest
+    })
+    app = FastAPI()
+    plugins.register_plugin_api(app)
+    client = TestClient(app)
+    try:
+        r = client.get("/api/plugins/bool_tour_plugin/tour.json")
+        assert r.status_code == 404
+        assert r.headers["content-type"].startswith("application/json")
+    finally:
+        client.close()
+
+
+def test_tour_json_rejects_directory_path(tmp_path, reset_plugin_state):
+    """A `tour` field of `"."` resolves to the plugin dir itself.  The route
+    must return 404 (not IsADirectoryError) because is_file() gates read_text."""
+    plugins = reset_plugin_state
+    plugin_dir = tmp_path / "dot_tour_plugin"
+    plugin_dir.mkdir()
+    plugins.LOADED_PLUGINS.append({
+        "id": "dot_tour_plugin",
+        "name": "Dot Tour Plugin",
+        "nav": None,
+        "type": None,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": False,
+        "has_tour": True,
+        "_dir": plugin_dir,
+        "_manifest": {"tour": "."},
+    })
+    app = FastAPI()
+    plugins.register_plugin_api(app)
+    client = TestClient(app)
+    try:
+        r = client.get("/api/plugins/dot_tour_plugin/tour.json")
+        assert r.status_code == 404
+        assert r.headers["content-type"].startswith("application/json")
+    finally:
+        client.close()
+
+
+def test_tour_json_rejects_null_file_key(tmp_path, reset_plugin_state):
+    """`{"tour": {"file": null}}` has an explicitly invalid `file` value.
+    _is_valid_tour_manifest must reject it (has_tour=False) and the route
+    must return 404 without an AttributeError."""
+    import plugins as _plugins_mod
+    # Directly verify the validation function rejects {"file": None}
+    assert _plugins_mod._is_valid_tour_manifest({"file": None}) is False
+    assert _plugins_mod._is_valid_tour_manifest({"file": ""}) is False
+    assert _plugins_mod._is_valid_tour_manifest({}) is True   # bare dict defaults to tour.json
+    plugins = reset_plugin_state
+    plugin_dir = tmp_path / "null_file_plugin"
+    plugin_dir.mkdir()
+    plugins.LOADED_PLUGINS.append({
+        "id": "null_file_plugin",
+        "name": "Null File Plugin",
+        "nav": None,
+        "type": None,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": False,
+        "has_tour": False,  # _is_valid_tour_manifest({"file": None}) → False
+        "_dir": plugin_dir,
+        "_manifest": {"tour": {"file": None}},
+    })
+    app = FastAPI()
+    plugins.register_plugin_api(app)
+    client = TestClient(app)
+    try:
+        # Confirm the listing endpoint reflects has_tour=False for this plugin
+        listing = client.get("/api/plugins").json()
+        p_entry = next(p for p in listing if p["id"] == "null_file_plugin")
+        assert p_entry["has_tour"] is False
+        # Route must also return 404 (defensive: route validates independently)
+        r = client.get("/api/plugins/null_file_plugin/tour.json")
+        assert r.status_code == 404
+        assert r.headers["content-type"].startswith("application/json")
+    finally:
+        client.close()
