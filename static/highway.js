@@ -4,6 +4,18 @@
  */
 function createHighway() {
     let canvas, ctx, ws;
+    // Promise chain for serializing async ws.onmessage handlers —
+    // reset on each connect() so reconnections start a fresh chain.
+    let _msgChain = Promise.resolve();
+    // Monotonically-increasing connection generation counter.
+    // Incremented on every connect() so async handlers that survive a
+    // reconnect can detect they are stale and bail out before mutating
+    // shared state.
+    let _wsGen = 0;
+    // Pending JUCE routing promise for the current connection's song_info.
+    // The 'ready' handler awaits this so _juceMode is settled before
+    // _onReady / song:ready fire, without blocking note/chord processing.
+    let _juceRoutingPromise = Promise.resolve();
     // Two notions of "now" — kept deliberately separate:
     //   chartTime — audio-aligned clock. What getTime() exposes to plugins
     //               (scoring, note detection, etc.) and what setTime() receives.
@@ -1790,216 +1802,292 @@ function createHighway() {
 
         connect(wsUrl, opts = {}) {
             _connectOpts = opts;
+            // Bump generation so async handlers from the previous connection
+            // can detect they are stale and skip state mutations.
+            _wsGen += 1;
+            // Fresh routing promise for this connection's song_info load.
+            _juceRoutingPromise = Promise.resolve();
             ws = new WebSocket(wsUrl);
             ws.onclose = () => { console.log('WS closed'); };
             ws.onerror = (e) => { console.error('WS error', e); };
-            ws.onmessage = (ev) => {
-                const msg = JSON.parse(ev.data);
-                if (msg.error) {
-                    console.error('Server error:', msg.error);
-                    if (opts.onError) opts.onError(msg.error);
-                    else alert('Error: ' + msg.error);
-                    return;
+            // Reset the serialization chain so old in-flight handlers
+            // from a previous connection don't delay new messages.
+            _msgChain = Promise.resolve();
+
+            // Helper: attach the HTML5 audio buffering overlay to `audio`.
+            // Shared by both the direct HTML5 path and the JUCE fallback path.
+            function _showAudioBufferingOverlay(audio) {
+                let overlay = document.getElementById('audio-buffer-overlay');
+                if (!overlay) {
+                    overlay = document.createElement('div');
+                    overlay.id = 'audio-buffer-overlay';
+                    overlay.className = 'fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm';
+                    overlay.innerHTML = `
+                        <div class="bg-dark-700 border border-gray-700 rounded-2xl p-6 w-72 text-center shadow-2xl">
+                            <div class="text-sm text-gray-300 mb-3">Loading audio...</div>
+                            <div style="height:6px;background:#1a1a2e;border-radius:999px;overflow:hidden">
+                                <div id="audio-buffer-bar" style="height:100%;background:linear-gradient(90deg,#4080e0,#60a0ff);border-radius:999px;width:0%;transition:width 0.3s"></div>
+                            </div>
+                            <div class="text-xs text-gray-500 mt-2" id="audio-buffer-pct">0%</div>
+                        </div>`;
+                    document.body.appendChild(overlay);
                 }
-                switch (msg.type) {
-                    case 'loading':
-                        console.log('Loading:', msg.stage);
-                        break;
-                    case 'song_info':
-                        songInfo = msg;
-                        // Pick up the active arrangement's string count.
-                        // Prefer the explicit `stringCount` field (added
-                        // in slopsmith-plugin-3dhighway#7); fall back to
-                        // `tuning.length` for older servers that haven't
-                        // started emitting it (works correctly for
-                        // GP-imported sources where tuning is already
-                        // truncated, and for sloppaks loaded against an
-                        // updated lib/song.py); final fallback is 6 for
-                        // safety so a missing/malformed payload doesn't
-                        // surface as 0 strings.
-                        //
-                        // Clamp to [1, MAX_STRINGS] before storing —
-                        // stringCount drives loop bounds in drawStrings
-                        // and downstream plugins. A malformed payload
-                        // (huge or zero / negative) would otherwise hang
-                        // the UI or render no strings at all. 8 covers
-                        // every real-world instrument we ship colors
-                        // for; values above that fall back to '#888'
-                        // anyway via the STRING_COLORS lookup so
-                        // capping the loop bound costs nothing visible.
-                        const MAX_STRINGS = 8;
-                        let _sc;
-                        if (typeof msg.stringCount === 'number' && msg.stringCount > 0) {
-                            _sc = msg.stringCount;
-                        } else if (Array.isArray(msg.tuning) && msg.tuning.length > 0) {
-                            _sc = msg.tuning.length;
-                        } else {
-                            _sc = 6;
+
+                const bar = document.getElementById('audio-buffer-bar');
+                const pct = document.getElementById('audio-buffer-pct');
+                const MIN_BUFFER_SECS = 30;
+
+                function onProgress() {
+                    if (audio.buffered.length > 0 && audio.duration > 0) {
+                        const loaded = audio.buffered.end(audio.buffered.length - 1);
+                        const p = Math.round((loaded / audio.duration) * 100);
+                        if (bar) bar.style.width = p + '%';
+                        if (pct) pct.textContent = p + '%';
+                        if (loaded >= MIN_BUFFER_SECS || loaded >= audio.duration) {
+                            cleanup();
                         }
-                        // Math.trunc(_sc) (with finite check) instead of
-                        // `_sc | 0` — bitwise-OR forces 32-bit signed
-                        // conversion, so any value ≥ 2^31 wraps negative
-                        // and the Math.max(1, ...) clamp would land at
-                        // 1 string. Math.trunc preserves the magnitude;
-                        // the Math.min(MAX_STRINGS, ...) below caps it
-                        // safely.
-                        const _scTrunc = Number.isFinite(_sc) ? Math.trunc(_sc) : 1;
-                        stringCount = Math.max(1, Math.min(MAX_STRINGS, _scTrunc));
-                        if (opts.onSongInfo) {
-                            opts.onSongInfo(msg);
-                        } else {
-                            document.getElementById('hud-artist').textContent = msg.artist;
-                            document.getElementById('hud-title').textContent = msg.title;
-                            document.getElementById('hud-arrangement').textContent = msg.arrangement;
+                    }
+                }
 
-                            // Clear any lingering audio-error banner from a prior song.
-                            const existingAudioErr = document.getElementById('audio-error-banner');
-                            if (existingAudioErr) existingAudioErr.remove();
+                function cleanup() {
+                    audio.removeEventListener('progress', onProgress);
+                    audio.removeEventListener('canplaythrough', cleanup);
+                    const ol = document.getElementById('audio-buffer-overlay');
+                    if (ol) ol.remove();
+                }
 
-                            // Server reported a concrete audio-pipeline failure and has
-                            // no URL to give us — surface it instead of leaving the
-                            // user with a cryptic "Empty src attribute" from audio.play().
-                            if (!msg.audio_url && msg.audio_error) {
-                                const banner = document.createElement('div');
-                                banner.id = 'audio-error-banner';
-                                banner.className = 'fixed top-4 left-1/2 -translate-x-1/2 z-[300] bg-red-900/95 border border-red-700 text-red-100 rounded-lg px-4 py-3 max-w-2xl shadow-xl';
-                                banner.innerHTML = `
-                                    <div class="flex items-start gap-3">
-                                        <span class="text-xl leading-none">⚠</span>
-                                        <div class="flex-1">
-                                            <div class="font-semibold text-sm">Audio unavailable</div>
-                                            <div class="text-xs text-red-200 mt-1"></div>
-                                        </div>
-                                        <button class="text-red-300 hover:text-white text-lg leading-none" aria-label="Dismiss">✕</button>
-                                    </div>`;
-                                banner.querySelector('.text-xs').textContent = msg.audio_error;
-                                banner.querySelector('button').addEventListener('click', () => banner.remove());
-                                document.body.appendChild(banner);
+                audio.addEventListener('progress', onProgress);
+                audio.addEventListener('canplaythrough', cleanup, { once: true });
+            }
+
+            ws.onmessage = (ev) => {
+                const data = ev.data;
+                // Capture generation synchronously before any async work so
+                // stale completions from a prior WebSocket can be detected.
+                const gen = _wsGen;
+                _msgChain = _msgChain.then(async () => {
+                    // Bail out if a reconnect happened while this step was queued.
+                    if (gen !== _wsGen) return;
+                    try {
+                    const msg = JSON.parse(data);
+                    if (msg.error) {
+                        console.error('Server error:', msg.error);
+                        if (opts.onError) opts.onError(msg.error);
+                        else alert('Error: ' + msg.error);
+                        return;
+                    }
+                    switch (msg.type) {
+                        case 'loading':
+                            console.log('Loading:', msg.stage);
+                            break;
+                        case 'song_info':
+                            songInfo = msg;
+                            // Pick up the active arrangement's string count.
+                            // Prefer the explicit `stringCount` field (added
+                            // in slopsmith-plugin-3dhighway#7); fall back to
+                            // `tuning.length` for older servers that haven't
+                            // started emitting it (works correctly for
+                            // GP-imported sources where tuning is already
+                            // truncated, and for sloppaks loaded against an
+                            // updated lib/song.py); final fallback is 6 for
+                            // safety so a missing/malformed payload doesn't
+                            // surface as 0 strings.
+                            //
+                            // Clamp to [1, MAX_STRINGS] before storing —
+                            // stringCount drives loop bounds in drawStrings
+                            // and downstream plugins. A malformed payload
+                            // (huge or zero / negative) would otherwise hang
+                            // the UI or render no strings at all. 8 covers
+                            // every real-world instrument we ship colors
+                            // for; values above that fall back to '#888'
+                            // anyway via the STRING_COLORS lookup so
+                            // capping the loop bound costs nothing visible.
+                            const MAX_STRINGS = 8;
+                            let _sc;
+                            if (typeof msg.stringCount === 'number' && msg.stringCount > 0) {
+                                _sc = msg.stringCount;
+                            } else if (Array.isArray(msg.tuning) && msg.tuning.length > 0) {
+                                _sc = msg.tuning.length;
+                            } else {
+                                _sc = 6;
                             }
-
-                            if (msg.audio_url) {
-                                const audio = document.getElementById('audio');
-                                if (!audio.src || !audio.src.includes(msg.audio_url.split('/').pop())) {
-                                    audio.src = msg.audio_url;
-                                    audio.load();
-
-                                    // Show buffering overlay
-                                    let overlay = document.getElementById('audio-buffer-overlay');
-                                    if (!overlay) {
-                                        overlay = document.createElement('div');
-                                        overlay.id = 'audio-buffer-overlay';
-                                        overlay.className = 'fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm';
-                                        overlay.innerHTML = `
-                                            <div class="bg-dark-700 border border-gray-700 rounded-2xl p-6 w-72 text-center shadow-2xl">
-                                                <div class="text-sm text-gray-300 mb-3">Loading audio...</div>
-                                                <div style="height:6px;background:#1a1a2e;border-radius:999px;overflow:hidden">
-                                                    <div id="audio-buffer-bar" style="height:100%;background:linear-gradient(90deg,#4080e0,#60a0ff);border-radius:999px;width:0%;transition:width 0.3s"></div>
-                                                </div>
-                                                <div class="text-xs text-gray-500 mt-2" id="audio-buffer-pct">0%</div>
-                                            </div>`;
-                                        document.body.appendChild(overlay);
-                                    }
-
-                                    const bar = document.getElementById('audio-buffer-bar');
-                                    const pct = document.getElementById('audio-buffer-pct');
-
-                                    const MIN_BUFFER_SECS = 30;
-
-                                    function onProgress() {
-                                        if (audio.buffered.length > 0 && audio.duration > 0) {
-                                            const loaded = audio.buffered.end(audio.buffered.length - 1);
-                                            const p = Math.round((loaded / audio.duration) * 100);
-                                            if (bar) bar.style.width = p + '%';
-                                            if (pct) pct.textContent = p + '%';
-                                            // Dismiss when enough is buffered
-                                            if (loaded >= MIN_BUFFER_SECS || loaded >= audio.duration) {
-                                                cleanup();
-                                            }
+                            // Math.trunc(_sc) (with finite check) instead of
+                            // `_sc | 0` — bitwise-OR forces 32-bit signed
+                            // conversion, so any value ≥ 2^31 wraps negative
+                            // and the Math.max(1, ...) clamp would land at
+                            // 1 string. Math.trunc preserves the magnitude;
+                            // the Math.min(MAX_STRINGS, ...) below caps it
+                            // safely.
+                            const _scTrunc = Number.isFinite(_sc) ? Math.trunc(_sc) : 1;
+                            stringCount = Math.max(1, Math.min(MAX_STRINGS, _scTrunc));
+                            if (opts.onSongInfo) {
+                                opts.onSongInfo(msg);
+                            } else {
+                                document.getElementById('hud-artist').textContent = msg.artist;
+                                document.getElementById('hud-title').textContent = msg.title;
+                                document.getElementById('hud-arrangement').textContent = msg.arrangement;
+    
+                                // Clear any lingering audio-error banner from a prior song.
+                                const existingAudioErr = document.getElementById('audio-error-banner');
+                                if (existingAudioErr) existingAudioErr.remove();
+    
+                                // Server reported a concrete audio-pipeline failure and has
+                                // no URL to give us — surface it instead of leaving the
+                                // user with a cryptic "Empty src attribute" from audio.play().
+                                if (!msg.audio_url && msg.audio_error) {
+                                    const banner = document.createElement('div');
+                                    banner.id = 'audio-error-banner';
+                                    banner.className = 'fixed top-4 left-1/2 -translate-x-1/2 z-[300] bg-red-900/95 border border-red-700 text-red-100 rounded-lg px-4 py-3 max-w-2xl shadow-xl';
+                                    banner.innerHTML = `
+                                        <div class="flex items-start gap-3">
+                                            <span class="text-xl leading-none">⚠</span>
+                                            <div class="flex-1">
+                                                <div class="font-semibold text-sm">Audio unavailable</div>
+                                                <div class="text-xs text-red-200 mt-1"></div>
+                                            </div>
+                                            <button class="text-red-300 hover:text-white text-lg leading-none" aria-label="Dismiss">✕</button>
+                                        </div>`;
+                                    banner.querySelector('.text-xs').textContent = msg.audio_error;
+                                    banner.querySelector('button').addEventListener('click', () => banner.remove());
+                                    document.body.appendChild(banner);
+                                }
+    
+                                if (msg.audio_url) {
+                                    const audio = document.getElementById('audio');
+                                    const audioFilename = msg.audio_url.split('/').pop();
+                                    const alreadyLoaded = window._juceMode
+                                        ? window._juceAudioUrl === msg.audio_url
+                                        : (audio.src && audio.src.includes(audioFilename));
+                                    if (!alreadyLoaded) {
+                                        const juceApi = window.slopsmithDesktop?.audio;
+                                        // Only attempt JUCE routing for /audio/ URLs — sloppak stems
+                                        // (/api/sloppak/…) are not resolvable via audio-local-path.
+                                        const isAudioUrl = msg.audio_url.startsWith('/audio/');
+                                        if (isAudioUrl && juceApi) {
+                                            // Run JUCE routing off the critical message-processing chain
+                                            // so subsequent notes/chords/ready messages aren't blocked
+                                            // waiting for IPC + HTTP round-trips. The 'ready' handler
+                                            // awaits _juceRoutingPromise so _juceMode is settled before
+                                            // _onReady / song:ready fire.
+                                            const audioUrl = msg.audio_url;
+                                            _juceRoutingPromise = (async () => {
+                                                try {
+                                                    if (await juceApi.isAudioRunning()) {
+                                                        if (gen !== _wsGen) return; // stale
+                                                        const res = await fetch(`/api/audio-local-path?url=${encodeURIComponent(audioUrl)}`);
+                                                        if (!res.ok) throw new Error('HTTP ' + res.status);
+                                                        const { path } = await res.json();
+                                                        await juceApi.loadBackingTrack(path);
+                                                        if (gen !== _wsGen) return; // stale
+                                                        if (window.jucePlayer) window.jucePlayer._dur = await juceApi.getBackingDuration();
+                                                        if (gen !== _wsGen) return; // stale
+                                                        window._juceMode = true;
+                                                        window._juceAudioUrl = audioUrl;
+                                                        // Clear the HTML5 element so it does not buffer an unused track
+                                                        audio.src = '';
+                                                        return;
+                                                    }
+                                                } catch (err) {
+                                                    console.warn('[highway] JUCE audio routing failed, falling back to HTML5:', err);
+                                                    if (gen !== _wsGen) return; // stale
+                                                    window._juceMode = false;
+                                                    window._juceAudioUrl = null;
+                                                }
+                                                // HTML5 fallback (isAudioRunning false, or JUCE error)
+                                                if (gen !== _wsGen) return; // stale
+                                                audio.src = audioUrl;
+                                                audio.load();
+                                                window._juceMode = false;
+                                                window._juceAudioUrl = null;
+                                                _showAudioBufferingOverlay(audio);
+                                            })();
+                                        } else {
+                                            // Non-JUCE path: sloppak stems, or no JUCE API present
+                                            audio.src = msg.audio_url;
+                                            audio.load();
+                                            window._juceMode = false;
+                                            window._juceAudioUrl = null;
+                                            _showAudioBufferingOverlay(audio);
                                         }
                                     }
-
-                                    function cleanup() {
-                                        audio.removeEventListener('progress', onProgress);
-                                        audio.removeEventListener('canplaythrough', cleanup);
-                                        const ol = document.getElementById('audio-buffer-overlay');
-                                        if (ol) ol.remove();
-                                    }
-
-                                    audio.addEventListener('progress', onProgress);
-                                    // Fallback: also dismiss on canplaythrough
-                                    audio.addEventListener('canplaythrough', cleanup, { once: true });
+                                }
+                                // Populate arrangement dropdown
+                                if (msg.arrangements) {
+                                    const sel = document.getElementById('arr-select');
+                                    sel.innerHTML = msg.arrangements.map(a =>
+                                        `<option value="${a.index}" ${a.index === msg.arrangement_index ? 'selected' : ''}>${a.name} (${a.notes})</option>`
+                                    ).join('');
                                 }
                             }
-                            // Populate arrangement dropdown
-                            if (msg.arrangements) {
-                                const sel = document.getElementById('arr-select');
-                                sel.innerHTML = msg.arrangements.map(a =>
-                                    `<option value="${a.index}" ${a.index === msg.arrangement_index ? 'selected' : ''}>${a.name} (${a.notes})</option>`
-                                ).join('');
+                            // Plugin context API — broadcast current song state
+                            if (window.slopsmith) {
+                                const wsPath = ws.url.split('/ws/highway/')[1] || '';
+                                const filename = decodeURIComponent(wsPath.split('?')[0]);
+                                window.slopsmith.currentSong = {
+                                    filename,
+                                    title: msg.title,
+                                    artist: msg.artist,
+                                    duration: msg.duration,
+                                    arrangement: msg.arrangement,
+                                    arrangementIndex: msg.arrangement_index,
+                                    arrangements: msg.arrangements || [],
+                                    tuning: msg.tuning,
+                                    capo: msg.capo,
+                                    format: msg.format,
+                                };
+                                window.slopsmith.emit('song:loaded', window.slopsmith.currentSong);
                             }
-                        }
-                        // Plugin context API — broadcast current song state
-                        if (window.slopsmith) {
-                            const wsPath = ws.url.split('/ws/highway/')[1] || '';
-                            const filename = decodeURIComponent(wsPath.split('?')[0]);
-                            window.slopsmith.currentSong = {
-                                filename,
-                                title: msg.title,
-                                artist: msg.artist,
-                                duration: msg.duration,
-                                arrangement: msg.arrangement,
-                                arrangementIndex: msg.arrangement_index,
-                                arrangements: msg.arrangements || [],
-                                tuning: msg.tuning,
-                                capo: msg.capo,
-                                format: msg.format,
-                            };
-                            window.slopsmith.emit('song:loaded', window.slopsmith.currentSong);
-                        }
-                        break;
-                    case 'beats': beats = msg.data; break;
-                    case 'sections': sections = msg.data; break;
-                    case 'anchors':
-                        anchors = msg.data;
-                        if (anchors.length) {
-                            displayMaxFret = Math.max(anchors[0].fret + anchors[0].width + 3, 8);
-                        }
-                        break;
-                    case 'chord_templates': chordTemplates = msg.data; break;
-                    case 'lyrics': lyrics = msg.data; break;
-                    case 'tone_changes': toneChanges = msg.data; toneBase = msg.base || ""; break;
-                    case 'notes': notes = notes.concat(msg.data); break;
-                    case 'chords': chords = chords.concat(msg.data); break;
-                    case 'phrases':
-                        // Accumulate chunks but DON'T rebuild the filter
-                        // until `ready` — rebuilding per chunk would
-                        // cause visual flicker (partial filtered array
-                        // visible while later chunks are still arriving)
-                        // and duplicate work.
-                        if (_phrases === null) _phrases = [];
-                        for (const p of msg.data) _phrases.push(p);
-                        break;
-                    case 'ready':
-                        ready = true;
-                        _rebuildMasteryFilter();
-                        console.log(`Highway ready: ${notes.length} notes, ${chords.length} chords` +
-                            (_phrases !== null ? `, ${_phrases.length} phrases (mastery ${Math.round(_mastery * 100)}%)` : ""));
-                        if (!animFrame) draw();
-                        if (api._onReady) api._onReady();
-                        // Broadcast to interested listeners (e.g. the
-                        // difficulty-slider disabled-state update in
-                        // app.js). Fires on every `ready`, including
-                        // arrangement switches — unlike `_onReady`,
-                        // which is a single-use callback slot.
-                        if (window.slopsmith) {
-                            // Reuse api.hasPhraseData so the emit and
-                            // the public getter agree on the sentinel.
-                            window.slopsmith.emit('song:ready', {
-                                hasPhraseData: api.hasPhraseData(),
-                            });
-                        }
-                        break;
-                }
+                            break;
+                        case 'beats': beats = msg.data; break;
+                        case 'sections': sections = msg.data; break;
+                        case 'anchors':
+                            anchors = msg.data;
+                            if (anchors.length) {
+                                displayMaxFret = Math.max(anchors[0].fret + anchors[0].width + 3, 8);
+                            }
+                            break;
+                        case 'chord_templates': chordTemplates = msg.data; break;
+                        case 'lyrics': lyrics = msg.data; break;
+                        case 'tone_changes': toneChanges = msg.data; toneBase = msg.base || ""; break;
+                        case 'notes': notes = notes.concat(msg.data); break;
+                        case 'chords': chords = chords.concat(msg.data); break;
+                        case 'phrases':
+                            // Accumulate chunks but DON'T rebuild the filter
+                            // until `ready` — rebuilding per chunk would
+                            // cause visual flicker (partial filtered array
+                            // visible while later chunks are still arriving)
+                            // and duplicate work.
+                            if (_phrases === null) _phrases = [];
+                            for (const p of msg.data) _phrases.push(p);
+                            break;
+                        case 'ready':
+                            ready = true;
+                            _rebuildMasteryFilter();
+                            console.log(`Highway ready: ${notes.length} notes, ${chords.length} chords` +
+                                (_phrases !== null ? `, ${_phrases.length} phrases (mastery ${Math.round(_mastery * 100)}%)` : ""));
+                            // Wait for the off-chain JUCE routing (if any) to settle
+                            // so _juceMode is correctly set before _onReady and song:ready fire.
+                            await _juceRoutingPromise.catch(() => {});
+                            if (!animFrame) draw();
+                            if (api._onReady) await Promise.resolve(api._onReady()).catch((err) => console.error('[highway] _onReady error:', err));
+                            // Broadcast to interested listeners (e.g. the
+                            // difficulty-slider disabled-state update in
+                            // app.js). Fires on every `ready`, including
+                            // arrangement switches — unlike `_onReady`,
+                            // which is a single-use callback slot.
+                            if (window.slopsmith) {
+                                // Reuse api.hasPhraseData so the emit and
+                                // the public getter agree on the sentinel.
+                                window.slopsmith.emit('song:ready', {
+                                    hasPhraseData: api.hasPhraseData(),
+                                });
+                            }
+                            break;
+                    }
+                    } catch (err) {
+                        console.error('[highway] ws.onmessage error:', err);
+                    }
+                }).catch((err) => { console.error('[highway] message chain error:', err); });
             };
         },
 

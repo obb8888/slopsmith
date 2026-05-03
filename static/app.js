@@ -709,7 +709,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 // ── Screen Navigation ─────────────────────────────────────────────────────
-function showScreen(id) {
+async function showScreen(id) {
     document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
     document.getElementById(id).classList.add('active');
     // Mark the next render as a screen-entry so it scrolls the
@@ -724,6 +724,11 @@ function showScreen(id) {
     if (id === 'settings') loadSettings();
     if (id !== 'player') {
         highway.stop();
+        if (window._juceMode) {
+            await jucePlayer.stop().catch(() => {});
+            window._juceMode = false;
+            window._juceAudioUrl = null;
+        }
         const audio = document.getElementById('audio');
         audio.pause();
         audio.src = '';
@@ -2139,6 +2144,99 @@ function retuneSong(filename, title, tuning, target) {
 // ── Player ───────────────────────────────────────────────────────────────
 const audio = document.getElementById('audio');
 let isPlaying = false;
+
+// In Slopsmith Desktop, WASAPI Exclusive Mode locks the audio device so Chromium
+// cannot play through it. When window._juceMode is true, song audio is routed
+// through the JUCE backing track player instead of the HTML5 <audio> element.
+window._juceMode = false;
+window._juceAudioUrl = null;
+const jucePlayer = {
+    _timer: null,
+    _pos: 0,
+    _dur: 0,
+    _pollAt: 0,    // performance.now() when _pos was last set
+    _polling: false,
+    get currentTime() {
+        if (!this._polling) return this._pos;
+        // Interpolate between IPC polls so highway motion is smooth at 60fps
+        const elapsed = (performance.now() - this._pollAt) / 1000;
+        return Math.min(this._pos + elapsed, this._dur > 0 ? this._dur : Infinity);
+    },
+    get duration() { return this._dur; },
+    async play() {
+        try {
+            await window.slopsmithDesktop.audio.startBacking();
+        } catch (err) {
+            console.warn('[jucePlayer] startBacking failed:', err);
+            return false;
+        }
+        this._startPolling();
+        return true;
+    },
+    async pause() {
+        // Snapshot the interpolated position before stopping the poll so
+        // _pos stays at the visible pause point rather than jumping back
+        // to the last raw IPC sample (which can be up to 100ms behind).
+        this._pos = this.currentTime;
+        this._pollAt = performance.now();
+        this._stopPolling();
+        try {
+            await window.slopsmithDesktop.audio.stopBacking();
+        } catch (err) {
+            console.warn('[jucePlayer] stopBacking failed:', err);
+        }
+    },
+    async seek(s) {
+        const prev = this._pos;
+        this._pos = s;
+        this._pollAt = performance.now();
+        try {
+            await window.slopsmithDesktop.audio.seekBacking(s);
+        } catch (err) {
+            console.warn('[jucePlayer] seekBacking failed:', err);
+            this._pos = prev;
+            this._pollAt = performance.now();
+        }
+    },
+    _startPolling() {
+        this._stopPolling();
+        this._polling = true;
+        this._pollAt = performance.now();
+        const self = this;
+        function scheduleNext() {
+            self._timer = setTimeout(async () => {
+                if (!self._polling) return;
+                try {
+                    self._pos = await window.slopsmithDesktop.audio.getBackingPosition();
+                    self._pollAt = performance.now();
+                } catch (err) {
+                    console.warn('[jucePlayer] position poll failed:', err);
+                } finally {
+                    if (self._polling) scheduleNext();
+                }
+            }, 100);
+        }
+        scheduleNext();
+    },
+    _stopPolling() {
+        this._polling = false;
+        if (this._timer) { clearTimeout(this._timer); this._timer = null; }
+    },
+    async stop() {
+        await this.pause();
+        this._pos = 0;
+        this._dur = 0;
+        this._pollAt = 0;
+    },
+};
+window.jucePlayer = jucePlayer;
+
+function _audioTime() { return window._juceMode ? jucePlayer.currentTime : audio.currentTime; }
+function _audioDuration() { return window._juceMode ? jucePlayer.duration : audio.duration; }
+async function _audioSeek(s) {
+    if (window._juceMode) return jucePlayer.seek(s);
+    else audio.currentTime = s;
+}
 let currentFilename = '';
 // Plugin context API — lightweight event bus for plugin integration
 window.slopsmith = Object.assign(new EventTarget(), {
@@ -2219,6 +2317,11 @@ async function playSong(filename, arrangement) {
     artAbortController = null;
 
     highway.stop();
+    if (window._juceMode) {
+        await jucePlayer.stop().catch(() => {});
+        window._juceMode = false;
+        window._juceAudioUrl = null;
+    }
     audio.pause();
     audio.src = '';
     isPlaying = false;
@@ -2248,11 +2351,15 @@ async function playSong(filename, arrangement) {
     document.getElementById('quality-select').value = highway.getRenderScale();
 }
 
-function changeArrangement(index) {
+async function changeArrangement(index) {
     if (currentFilename) {
         const wasPlaying = isPlaying;
-        const time = audio.currentTime;
-        if (isPlaying) { audio.pause(); isPlaying = false; }
+        const time = _audioTime();
+        if (isPlaying) {
+            if (window._juceMode) await jucePlayer.pause();
+            else audio.pause();
+            isPlaying = false;
+        }
 
         // Show loading overlay
         let overlay = document.getElementById('arr-loading');
@@ -2268,12 +2375,19 @@ function changeArrangement(index) {
         document.body.appendChild(overlay);
 
         // Set callback for when data is ready
-        highway._onReady = () => {
+        highway._onReady = async () => {
             const ol = document.getElementById('arr-loading');
             if (ol) ol.remove();
-            audio.currentTime = time;
+            await _audioSeek(time);
             if (wasPlaying) {
-                audio.play().then(() => { isPlaying = true; }).catch(() => {});
+                if (window._juceMode) {
+                    const started = await jucePlayer.play();
+                    if (started) {
+                        isPlaying = true;
+                        window.slopsmith.isPlaying = true;
+                        window.slopsmith.emit('song:play', { time: jucePlayer.currentTime });
+                    }
+                } else audio.play().then(() => { isPlaying = true; }).catch(() => {});
             }
             highway._onReady = null;
         };
@@ -2283,7 +2397,24 @@ function changeArrangement(index) {
     }
 }
 
-function togglePlay() {
+async function togglePlay() {
+    if (window._juceMode) {
+        if (isPlaying) {
+            await jucePlayer.pause();
+            isPlaying = false;
+            document.getElementById('btn-play').textContent = '▶ Play';
+            window.slopsmith.isPlaying = false;
+            window.slopsmith.emit('song:pause', { time: jucePlayer.currentTime });
+        } else {
+            const started = await jucePlayer.play();
+            if (!started) return; // startBacking() failed — IPC error already logged
+            isPlaying = true;
+            document.getElementById('btn-play').textContent = '⏸ Pause';
+            window.slopsmith.isPlaying = true;
+            window.slopsmith.emit('song:play', { time: jucePlayer.currentTime });
+        }
+        return;
+    }
     if (isPlaying) {
         audio.pause(); isPlaying = false;
         document.getElementById('btn-play').textContent = '▶ Play';
@@ -2293,8 +2424,17 @@ function togglePlay() {
     }
 }
 
-function seekBy(s) { audio.currentTime = Math.max(0, audio.currentTime + s); }
+async function seekBy(s) {
+    if (window._juceMode) { await jucePlayer.seek(Math.max(0, jucePlayer.currentTime + s)); return; }
+    audio.currentTime = Math.max(0, audio.currentTime + s);
+}
 function setSpeed(v) {
+    if (window._juceMode) {
+        audio.playbackRate = 1.0;
+        document.getElementById('speed-slider').value = 100;
+        document.getElementById('speed-label').textContent = '1.0x';
+        return;
+    }
     audio.playbackRate = parseFloat(v);
     document.getElementById('speed-label').textContent = parseFloat(v).toFixed(2) + 'x';
 }
@@ -2608,14 +2748,14 @@ let loopA = null;
 let loopB = null;
 
 function setLoopStart() {
-    loopA = audio.currentTime;
+    loopA = _audioTime();
     document.getElementById('btn-loop-a').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
     updateLoopUI();
 }
 
 function setLoopEnd() {
     if (loopA === null) return;
-    loopB = audio.currentTime;
+    loopB = _audioTime();
     if (loopB <= loopA) { loopB = null; return; }
     document.getElementById('btn-loop-b').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
     updateLoopUI();
@@ -2668,7 +2808,7 @@ async function loadSavedLoops() {
     delBtn.classList.add('hidden');
 }
 
-function loadSavedLoop(loopId) {
+async function loadSavedLoop(loopId) {
     const sel = document.getElementById('saved-loops');
     const opt = sel.selectedOptions[0];
     const delBtn = document.getElementById('btn-loop-delete');
@@ -2678,7 +2818,7 @@ function loadSavedLoop(loopId) {
     }
     loopA = parseFloat(opt.dataset.start);
     loopB = parseFloat(opt.dataset.end);
-    audio.currentTime = loopA;
+    await _audioSeek(loopA);
     document.getElementById('btn-loop-a').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
     document.getElementById('btn-loop-b').className = 'px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
     updateLoopUI();
@@ -2744,10 +2884,14 @@ function hideCountOverlay() {
     if (_countOverlay) { _countOverlay.remove(); _countOverlay = null; }
 }
 
-function startCountIn() {
+async function startCountIn() {
     if (_countingIn) return;
     _countingIn = true;
-    audio.pause();
+    if (window._juceMode) {
+        await jucePlayer.pause().catch((err) => console.error('[app] jucePlayer.pause error in count-in:', err));
+    } else {
+        audio.pause();
+    }
 
     // Rewind animation: sweep highway time from B to A
     const rewindDuration = 400; // ms
@@ -2765,11 +2909,14 @@ function startCountIn() {
         if (t < 1) {
             requestAnimationFrame(rewindStep);
         } else {
-            // Rewind done — set final position and start count
-            audio.currentTime = loopA;
-            lastAudioTime = loopA;
-            highway.setTime(loopA);
-            beginCount();
+            // Rewind done — set final position and start count.
+            // Await the JUCE seek so the engine has repositioned before
+            // we start the click track (HTML5 path is synchronous).
+            _audioSeek(loopA).then(() => {
+                lastAudioTime = loopA;
+                highway.setTime(loopA);
+                beginCount();
+            });
         }
     }
     requestAnimationFrame(rewindStep);
@@ -2784,9 +2931,19 @@ function startCountIn() {
             if (count > 4) {
                 hideCountOverlay();
                 _countingIn = false;
-                audio.play();
-                isPlaying = true;
-                document.getElementById('btn-play').textContent = '⏸ Pause';
+                if (window._juceMode) {
+                    jucePlayer.play().then((started) => {
+                        if (!started) return;
+                        isPlaying = true;
+                        document.getElementById('btn-play').textContent = '⏸ Pause';
+                        window.slopsmith.isPlaying = true;
+                        window.slopsmith.emit('song:play', { time: jucePlayer.currentTime });
+                    }).catch((err) => console.error('[app] jucePlayer.play error:', err));
+                } else {
+                    audio.play();
+                    isPlaying = true;
+                    document.getElementById('btn-play').textContent = '⏸ Pause';
+                }
                 return;
             }
             showCountOverlay(count);
@@ -2800,21 +2957,31 @@ function startCountIn() {
 // Time display + highway sync
 let lastAudioTime = 0;
 setInterval(() => {
-    if (audio.duration && !_countingIn) {
+    const ct = _audioTime();
+    const dur = _audioDuration();
+    if (dur && !_countingIn) {
+        // JUCE end-of-track: HTML5 fires 'ended'; JUCE needs a manual check
+        if (window._juceMode && isPlaying && ct >= dur) {
+            isPlaying = false;
+            document.getElementById('btn-play').textContent = '▶ Play';
+            window.slopsmith.isPlaying = false;
+            window.slopsmith.emit('song:ended', { time: ct });
+            jucePlayer.pause().catch((err) => console.warn('[app] end-of-track pause error:', err));
+        }
         // A-B loop: count-in then seek back to A
-        if (loopA !== null && loopB !== null && audio.currentTime >= loopB) {
+        else if (loopA !== null && loopB !== null && ct >= loopB) {
             lastAudioTime = loopB;
             startCountIn();
         }
-        // Detect and fix audio time jumps (browser seeking bug)
-        else if (isPlaying && Math.abs(audio.currentTime - lastAudioTime) > 30 && lastAudioTime > 0) {
-            console.warn(`Audio time jumped from ${lastAudioTime.toFixed(1)} to ${audio.currentTime.toFixed(1)}, resetting`);
+        // Detect and fix audio time jumps (browser seeking bug; skip for JUCE — position is polled)
+        else if (!window._juceMode && isPlaying && Math.abs(ct - lastAudioTime) > 30 && lastAudioTime > 0) {
+            console.warn(`Audio time jumped from ${lastAudioTime.toFixed(1)} to ${ct.toFixed(1)}, resetting`);
             audio.currentTime = lastAudioTime;
         }
-        lastAudioTime = audio.currentTime;
-        document.getElementById('hud-time').textContent = `${formatTime(audio.currentTime)} / ${formatTime(audio.duration)}`;
+        lastAudioTime = ct;
+        document.getElementById('hud-time').textContent = `${formatTime(ct)} / ${formatTime(dur)}`;
     }
-    if (!_countingIn) highway.setTime(audio.currentTime);
+    if (!_countingIn) highway.setTime(ct);
 }, 1000 / 60);
 
 // Keyboard shortcuts (player only)

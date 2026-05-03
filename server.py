@@ -27,6 +27,7 @@ import sloppak as sloppak_mod
 import concurrent.futures
 import contextvars
 import inspect
+import ipaddress
 import re
 import sqlite3
 import threading
@@ -2823,13 +2824,60 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
 # ── Audio serving ─────────────────────────────────────────────────────────────
 
 
+@app.get("/api/audio-local-path")
+def audio_local_path(url: str, request: Request):
+    """Return absolute local filesystem path for an /audio/… URL (Electron desktop only).
+
+    Accepts ``/audio/<path>`` where ``<path>`` may include subdirectory segments —
+    no scheme, no host, no query string, no fragment.  The resolved path must stay
+    inside AUDIO_CACHE_DIR or STATIC_DIR; ``..`` traversal, backslashes, and
+    absolute ``filename`` values are rejected.
+
+    This endpoint returns a raw filesystem path and is intended exclusively for
+    the Electron desktop process (which runs on loopback). Requests from non-
+    loopback clients are rejected with 403.
+    """
+    # Loopback-only — only the local Electron process should call this
+    client_host = request.client.host if request.client else None
+    try:
+        is_loopback = bool(client_host and ipaddress.ip_address(client_host).is_loopback)
+    except ValueError:
+        is_loopback = client_host == "localhost"
+    if not is_loopback:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    # Accept only simple /audio/<filename> — no scheme, no host, no query/fragment
+    if not re.fullmatch(r"/audio/[^?#]+", url):
+        return JSONResponse({"error": "invalid url"}, status_code=400)
+    filename = url[len("/audio/"):]
+    # Reject traversal, absolute paths, and backslash separators
+    if ".." in filename.split("/") or filename.startswith("/") or "\\" in filename:
+        return JSONResponse({"error": "invalid url"}, status_code=400)
+    for d in [AUDIO_CACHE_DIR, STATIC_DIR]:
+        candidate = (d / filename).resolve()
+        # Ensure resolved path is inside the allowed directory
+        try:
+            candidate.relative_to(d.resolve())
+        except ValueError:
+            continue
+        if candidate.is_file():
+            return JSONResponse({"path": str(candidate)})
+    return JSONResponse({"error": "not found"}, status_code=404)
+
+
 @app.get("/audio/{filename:path}")
 def serve_audio(filename: str):
     """Serve audio files from the writable audio cache directory."""
+    # Reject traversal attempts and absolute-path components
+    if ".." in filename.split("/") or filename.startswith("/") or "\\" in filename:
+        return JSONResponse({"error": "not found"}, status_code=404)
     for d in [AUDIO_CACHE_DIR, STATIC_DIR]:
-        audio_file = d / filename
-        if audio_file.exists():
-            return FileResponse(str(audio_file))
+        candidate = (d / filename).resolve()
+        try:
+            candidate.relative_to(d.resolve())
+        except ValueError:
+            continue
+        if candidate.is_file():
+            return FileResponse(str(candidate))
     return JSONResponse({"error": "not found"}, status_code=404)
 
 
