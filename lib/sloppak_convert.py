@@ -13,6 +13,7 @@ callback that the job queue forwards to the client over a WebSocket.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -23,6 +24,8 @@ import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 from typing import Callable, Optional
+
+log = logging.getLogger("slopsmith.lib.sloppak_convert")
 
 import yaml
 
@@ -46,8 +49,8 @@ def _progress(cb: ProgressCB, frac: float, stage: str, msg: str) -> None:
     if cb:
         try:
             cb(frac, stage, msg)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("progress callback raised: %s", e)
 
 
 def _arrangement_id(name: str, used: set[str]) -> str:
@@ -92,7 +95,8 @@ def _parse_lyrics(extracted_dir: Path) -> list[dict]:
     for xml_path in sorted(extracted_dir.rglob("*.xml")):
         try:
             root = ET.parse(xml_path).getroot()
-        except Exception:
+        except Exception as e:
+            log.debug("lyrics XML parse error in %s: %s", xml_path.name, e)
             continue
         if root.tag != "vocals":
             continue
@@ -132,7 +136,8 @@ def _extract_cover(extracted_dir: Path, out_jpg: Path) -> bool:
         out_jpg.parent.mkdir(parents=True, exist_ok=True)
         img.save(str(out_jpg), "JPEG", quality=88)
         return True
-    except Exception:
+    except Exception as e:
+        log.debug("cover art extraction failed: %s", e)
         return False
 
 
@@ -267,8 +272,8 @@ def _get_demucs_server_url() -> str | None:
             url = cfg.get("demucs_server_url", "")
             if url:
                 return url.rstrip("/")
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("failed to read demucs_server_url from config: %s", e)
     return None
 
 
@@ -422,7 +427,7 @@ def _split_in_dir(
             try:
                 result_dir = _run_demucs_remote(full_ogg, Path(td), model)
             except Exception as e:
-                print(f"[Demucs] Remote failed ({e}), falling back to local")
+                log.warning("Demucs remote failed (%s), falling back to local", e)
                 if demucs_available():
                     result_dir = _run_demucs(full_ogg, Path(td), model)
                 else:

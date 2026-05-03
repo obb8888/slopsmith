@@ -4,9 +4,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import bisect
 import json
+import logging
 import os
 import subprocess
 import xml.etree.ElementTree as ET
+
+log = logging.getLogger("slopsmith.lib.song")
 
 
 @dataclass
@@ -778,7 +781,7 @@ def _convert_sng_to_xml(extracted_dir: str):
                 rscli = str(p)
                 break
     if not rscli:
-        print("RsCli not found, cannot convert SNG to XML")
+        log.warning("RsCli not found, cannot convert SNG to XML")
         return
 
     # Detect platform from directory structure
@@ -807,9 +810,9 @@ def _convert_sng_to_xml(extracted_dir: str):
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode != 0:
-                print(f"sng2xml failed for {stem}: {result.stderr}")
+                log.warning("sng2xml failed for %s: %s", stem, result.stderr)
         except Exception as e:
-            print(f"sng2xml error for {stem}: {e}")
+            log.warning("sng2xml error for %s: %s", stem, e)
 
 
 def load_song(extracted_dir: str) -> Song:

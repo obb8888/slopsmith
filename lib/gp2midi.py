@@ -1,11 +1,14 @@
 """Generate MIDI and render audio from a Guitar Pro file."""
 
 import glob
+import logging
 import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+log = logging.getLogger("slopsmith.lib.gp2midi")
 
 import guitarpro
 from midiutil import MIDIFile
@@ -157,11 +160,7 @@ def _find_soundfont() -> str | None:
     if override:
         if os.path.isfile(override):
             return override
-        print(
-            f"[slopsmith] SLOPSMITH_SOUNDFONT is set to {override!r} but that "
-            "file does not exist; falling back to other sources.",
-            file=sys.stderr,
-        )
+        log.warning("SLOPSMITH_SOUNDFONT is set to %r but that file does not exist; falling back to other sources", override)
 
     resources = os.environ.get("RESOURCESPATH")
     if resources:
@@ -299,9 +298,9 @@ def gp_to_audio(gp_path: str, output_path: str,
     tmp_midi = tempfile.mktemp(suffix=".mid", prefix="rs_midi_")
     try:
         tuning_label = " (E Standard)" if force_standard_tuning else ""
-        print(f"Generating MIDI from {Path(gp_path).name}{tuning_label}...")
+        log.info("Generating MIDI from %s%s", Path(gp_path).name, tuning_label)
         gp_to_midi(gp_path, tmp_midi, track_indices, force_standard_tuning)
-        print(f"Rendering audio with FluidSynth...")
+        log.info("Rendering audio with FluidSynth...")
         return render_midi_to_audio(tmp_midi, output_path)
     finally:
         if os.path.exists(tmp_midi):

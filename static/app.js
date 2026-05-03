@@ -1272,16 +1272,10 @@ function renderGridCards(songs, containerId = 'lib-grid', mode = 'replace') {
         const isSloppak = s.format === 'sloppak';
         const stdRetune = !isSloppak && tuning && !s.has_estd &&
             ['Eb Standard', 'D Standard', 'C# Standard', 'C Standard'].includes(tuning);
-        const dropRetune = !isSloppak && tuning && !s.has_estd &&
-            ['Drop C', 'Drop C#', 'Drop Bb', 'Drop A'].includes(tuning);
         const retuneBtn = stdRetune
             ? `<button data-retune="${encodeURIComponent(s.filename)}" data-title="${encodeURIComponent(title)}" data-tuning="${tuning}" data-target="E Standard"
                 class="retune-btn mt-2 w-full px-2 py-1.5 bg-gold/10 hover:bg-gold/20 border border-gold/20 rounded-lg text-xs font-medium text-gold transition">
                 ⬆ Convert to E Standard</button>`
-            : dropRetune
-            ? `<button data-retune="${encodeURIComponent(s.filename)}" data-title="${encodeURIComponent(title)}" data-tuning="${tuning}" data-target="Drop D"
-                class="retune-btn mt-2 w-full px-2 py-1.5 bg-gold/10 hover:bg-gold/20 border border-gold/20 rounded-lg text-xs font-medium text-gold transition">
-                ⬆ Convert to Drop D</button>`
             : '';
         const fmtBadge = formatBadge(s.format, s.stem_count);
         const ariaLabel = `Play ${title || s.filename}${artist ? ' by ' + artist : ''}`;
@@ -1458,10 +1452,6 @@ async function renderTreeInto(containerId, countId, stats, letter, q, favoritesO
                 const isSloppak = s.format === 'sloppak';
                 const stdRetune = !isSloppak && tuning && !s.has_estd &&
                     ['Eb Standard', 'D Standard', 'C# Standard', 'C Standard'].includes(tuning);
-                const dropRetune = !isSloppak && tuning && !s.has_estd &&
-                    ['Drop C', 'Drop C#', 'Drop Bb', 'Drop A'].includes(tuning);
-                const canRetune = stdRetune || dropRetune;
-                const retuneTarget = stdRetune ? 'E Standard' : 'Drop D';
                 const rowAria = _escAttr(`Play ${title}${artist.name ? ' by ' + artist.name : ''}`);
                 html += `<div class="song-row" data-play="${encodeURIComponent(s.filename)}" data-artist="${_escAttr(artist.name || '')}" tabindex="0" role="button" aria-label="${rowAria}">`;
                 html += `<div class="flex-1 min-w-0 flex items-center gap-2"><span class="text-sm text-white truncate block">${esc(title)}</span>${formatBadgeInline(s.format, s.stem_count)}</div>`;
@@ -1479,9 +1469,9 @@ async function renderTreeInto(containerId, countId, stats, letter, q, favoritesO
                     html += `<span class="px-1.5 py-0.5 bg-purple-900/30 rounded text-purple-300">Lyrics</span>`;
                 if (duration)
                     html += `<span class="text-gray-600 w-10 text-right">${duration}</span>`;
-                if (canRetune)
-                    html += `<button data-retune="${encodeURIComponent(s.filename)}" data-title="${encodeURIComponent(title)}" data-tuning="${tuning}" data-target="${retuneTarget}"
-                        class="retune-btn px-1.5 py-0.5 bg-gold/10 hover:bg-gold/20 border border-gold/20 rounded text-gold" title="Convert to ${retuneTarget}">${dropRetune ? 'D' : 'E'}</button>`;
+                if (stdRetune)
+                    html += `<button data-retune="${encodeURIComponent(s.filename)}" data-title="${encodeURIComponent(title)}" data-tuning="${tuning}" data-target="E Standard"
+                        class="retune-btn px-1.5 py-0.5 bg-gold/10 hover:bg-gold/20 border border-gold/20 rounded text-gold" title="Convert to E Standard">E</button>`;
                 html += editBtn(s);
                 html += heartBtn(s.filename, s.favorite);
                 html += `</div></div>`;

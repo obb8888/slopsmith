@@ -73,19 +73,37 @@ def test_find_soundfont_returns_none_when_nothing_exists(tmp_path, monkeypatch):
     assert gp2midi._find_soundfont() is None
 
 
-def test_find_soundfont_warns_on_invalid_env_var(tmp_path, monkeypatch, capsys):
-    # Env var set to a non-existent path: warn on stderr so the misconfig is
-    # visible in the server log, then fall through.
+def test_find_soundfont_warns_on_invalid_env_var(tmp_path, monkeypatch, caplog):
+    import logging
+    # Env var set to a non-existent path: warning is emitted via the logger so
+    # it is captured by log aggregators and shows up in structured output.
     monkeypatch.setenv("SLOPSMITH_SOUNDFONT", str(tmp_path / "nope.sf2"))
     monkeypatch.delenv("RESOURCESPATH", raising=False)
     monkeypatch.setattr(gp2midi.sys, "platform", "unknown-os")
 
-    result = gp2midi._find_soundfont()
-    assert result is None
+    # Add caplog's handler directly to the slopsmith.lib.gp2midi logger so it
+    # captures records regardless of the slopsmith root logger's propagate flag
+    # (configure_logging() sets propagate=False, which prevents records from
+    # reaching the root logger where caplog normally listens).
+    # Also disable propagation temporarily to prevent double-capture when the
+    # slopsmith hierarchy has not been configured (records would otherwise
+    # propagate to the root logger where caplog already listens).
+    gp2midi_log = logging.getLogger("slopsmith.lib.gp2midi")
+    orig_level = gp2midi_log.level
+    orig_propagate = gp2midi_log.propagate
+    gp2midi_log.addHandler(caplog.handler)
+    gp2midi_log.setLevel(logging.WARNING)
+    gp2midi_log.propagate = False
+    try:
+        result = gp2midi._find_soundfont()
+    finally:
+        gp2midi_log.removeHandler(caplog.handler)
+        gp2midi_log.setLevel(orig_level)
+        gp2midi_log.propagate = orig_propagate
 
-    captured = capsys.readouterr()
-    assert "SLOPSMITH_SOUNDFONT" in captured.err
-    assert "does not exist" in captured.err
+    assert result is None
+    assert "SLOPSMITH_SOUNDFONT" in caplog.text
+    assert "does not exist" in caplog.text
 
 
 @pytest.mark.parametrize("platform,target", [

@@ -14,11 +14,14 @@ See the format spec in the project's sloppak plan for the full layout.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import threading
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+
+log = logging.getLogger("slopsmith.lib.sloppak")
 
 import yaml
 
@@ -182,7 +185,8 @@ def load_song(
             continue
         try:
             data = json.loads(arr_path.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as e:
+            log.debug("sloppak: failed to parse arrangement %r: %s", rel, e)
             continue
         arr = arrangement_from_wire(data)
         # Manifest-level overrides take precedence over anything embedded in
@@ -220,8 +224,8 @@ def load_song(
         if lyr_path.exists():
             try:
                 song.lyrics = json.loads(lyr_path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("sloppak: failed to parse lyrics %r: %s", lyrics_rel, e)
 
     # Stem descriptors — normalized for callers. File paths are resolved but
     # returned as ``file`` relative strings so URL construction stays caller-side.

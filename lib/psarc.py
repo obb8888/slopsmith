@@ -1,9 +1,12 @@
 """PSARC file extractor for Rocksmith 2014."""
 
 import fnmatch
+import logging
 import struct
 import zlib
 from pathlib import Path
+
+log = logging.getLogger("slopsmith.lib.psarc")
 
 try:
     from Crypto.Cipher import AES
@@ -125,8 +128,8 @@ def read_psarc_entries(filepath: str, patterns: list[str] | None = None) -> dict
             try:
                 data = _extract_entry(f, entry, block_sizes, block_size)
                 result[filename] = data
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("psarc: failed to read entry %r: %s", filename, e)
     return result
 
 
@@ -148,7 +151,8 @@ def unpack_psarc(filepath: str, output_dir: str) -> list[str]:
                 data = _extract_entry(f, entry, block_sizes, block_size)
                 outpath.write_bytes(data)
                 extracted.append(str(outpath))
-            except Exception:
-                outpath.write_bytes(b"")
+            except Exception as e:
+                log.warning("psarc: failed to extract %r, skipping: %s", filename, e)
+                continue
 
     return extracted

@@ -51,19 +51,17 @@ def configure_logging() -> None:
     raw_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, raw_level, None)
     if not isinstance(level, int):
-        print(
+        sys.stderr.write(
             f"[slopsmith] WARNING: unrecognised LOG_LEVEL={raw_level!r};"
-            " falling back to INFO.",
-            file=sys.stderr,
+            " falling back to INFO.\n"
         )
         level = logging.INFO
 
     raw_fmt = os.environ.get("LOG_FORMAT", "text").lower()
     if raw_fmt not in ("json", "text"):
-        print(
+        sys.stderr.write(
             f"[slopsmith] WARNING: unrecognised LOG_FORMAT={raw_fmt!r};"
-            " falling back to 'text'.",
-            file=sys.stderr,
+            " falling back to 'text'.\n"
         )
         raw_fmt = "text"
     fmt = raw_fmt
@@ -138,10 +136,9 @@ def configure_logging() -> None:
             fh.setFormatter(file_formatter)
             handlers.append(fh)
         except OSError as exc:
-            print(
+            sys.stderr.write(
                 f"[slopsmith] WARNING: could not open LOG_FILE={log_file!r}: {exc}"
-                " — continuing with console-only logging.",
-                file=sys.stderr,
+                " — continuing with console-only logging.\n"
             )
 
     _uvicorn_names = ("uvicorn", "uvicorn.error", "uvicorn.access")

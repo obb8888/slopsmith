@@ -2,8 +2,11 @@
 Strips the RIFF/BKHD wrapper and reconstructs valid OGG Vorbis data.
 This is a fallback for platforms without vgmstream (e.g. Android)."""
 
+import logging
 import struct
 import os
+
+log = logging.getLogger("slopsmith.lib.wem_decode")
 
 
 def convert_wem_to_ogg(wem_path: str, output_path: str) -> bool:
@@ -19,7 +22,7 @@ def convert_wem_to_ogg(wem_path: str, output_path: str) -> bool:
 
         return False
     except Exception as e:
-        print(f"WEM decode error: {e}")
+        log.warning("WEM decode error for %s -> %s: %s", wem_path, output_path, e, exc_info=True)
         return False
 
 

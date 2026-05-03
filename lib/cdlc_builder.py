@@ -1,6 +1,7 @@
 """Build a complete Rocksmith 2014 CDLC .psarc from arrangement XMLs + audio."""
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -8,6 +9,8 @@ import subprocess
 import tempfile
 import uuid
 from pathlib import Path
+
+log = logging.getLogger("slopsmith.lib.cdlc_builder")
 
 from patcher import pack_psarc
 
@@ -195,7 +198,7 @@ def build_cdlc(
     def progress(msg, pct=0):
         if on_progress:
             on_progress(msg, pct)
-        print(f"  [{pct:.0f}%] {msg}")
+        log.info("[%.0f%%] %s", pct, msg)
 
     try:
         build_dir = tmp / dlc_key

@@ -5,12 +5,15 @@ e.g. Eb standard (-1), D standard (-2), C# standard (-3).
 """
 
 import json
+import logging
 import os
 import shutil
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+log = logging.getLogger("slopsmith.lib.retune")
 
 from patcher import unpack_psarc, pack_psarc
 
@@ -76,7 +79,7 @@ def get_tuning(psarc_path: str) -> tuple[list[int], bool]:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _pitch_shift_wem(wem_path: Path, semitones: int) -> bool:
+def _pitch_shift_wem(wem_path: Path, semitones: int, on_progress=None) -> bool:
     """Decode a WEM, pitch-shift it, and replace the original file.
 
     Returns True if successful.
@@ -94,7 +97,9 @@ def _pitch_shift_wem(wem_path: Path, semitones: int) -> bool:
         )
         if r.returncode == 0 and wav_decoded.exists() and wav_decoded.stat().st_size > 100:
             decoded = True
-            print(f"    Decoded with vgmstream ({wav_decoded.stat().st_size} bytes)")
+            log.info("Decoded with vgmstream (%d bytes)", wav_decoded.stat().st_size)
+            if on_progress:
+                on_progress(f"Decoded: {wem_path.name}", 45)
 
     if not decoded and shutil.which("ffmpeg"):
         r = subprocess.run(
@@ -103,10 +108,12 @@ def _pitch_shift_wem(wem_path: Path, semitones: int) -> bool:
         )
         if r.returncode == 0 and wav_decoded.exists() and wav_decoded.stat().st_size > 100:
             decoded = True
-            print(f"    Decoded with ffmpeg ({wav_decoded.stat().st_size} bytes)")
+            log.info("Decoded with ffmpeg (%d bytes)", wav_decoded.stat().st_size)
+            if on_progress:
+                on_progress(f"Decoded: {wem_path.name}", 45)
 
     if not decoded:
-        print(f"    FAILED to decode {wem_path.name}")
+        log.warning("FAILED to decode %s", wem_path.name)
         # Cleanup
         for f in [wav_decoded, wav_shifted, ogg_out]:
             if f.exists():
@@ -133,13 +140,15 @@ def _pitch_shift_wem(wem_path: Path, semitones: int) -> bool:
     wav_decoded.unlink()
 
     if r.returncode != 0 or not ogg_out.exists():
-        print(f"    FAILED to pitch-shift: {r.stderr[-200:]}")
+        log.warning("FAILED to pitch-shift: %s", r.stderr[-200:])
         for f in [wav_shifted, ogg_out]:
             if f.exists():
                 f.unlink()
         return False
 
-    print(f"    Shifted {semitones:+d} semitones ({ogg_out.stat().st_size} bytes)")
+    log.info("Shifted %+d semitones (%d bytes)", semitones, ogg_out.stat().st_size)
+    if on_progress:
+        on_progress(f"Shifted: {wem_path.name}", 60)
 
     # Step 3: Replace original WEM with shifted OGG
     # (Rocksmith accepts OGG files with .wem extension)
@@ -148,12 +157,13 @@ def _pitch_shift_wem(wem_path: Path, semitones: int) -> bool:
     return True
 
 
-def retune_to_standard(psarc_path: str, output_path: str = "") -> str:
+def retune_to_standard(psarc_path: str, output_path: str = "", on_progress=None) -> str:
     """Pitch-shift a CDLC to E standard tuning.
 
     Args:
         psarc_path: Input .psarc file
         output_path: Output path (default: same name with _EStd suffix)
+        on_progress: Optional callback(stage: str, pct: float) for progress events
 
     Returns:
         Path to the new .psarc file
@@ -173,25 +183,27 @@ def retune_to_standard(psarc_path: str, output_path: str = "") -> str:
         )
 
     semitones = -offsets[0]  # e.g. offset=-1 (Eb) → shift up by 1
-    print(f"Tuning: {offsets} → shifting {semitones:+d} semitone(s)")
+    log.info("Tuning: %s → shifting %+d semitone(s)", offsets, semitones)
 
     tmp = Path(tempfile.mkdtemp(prefix="rs_retune_"))
     try:
         # Extract
-        print("Extracting PSARC...")
+        log.info("Extracting PSARC...")
         unpack_psarc(psarc_path, str(tmp))
 
         # Pitch-shift all audio files
         shifted_count = 0
         for wem in sorted(tmp.rglob("*.wem")):
-            print(f"Processing: {wem.name}")
-            if _pitch_shift_wem(wem, semitones):
+            log.info("Processing: %s", wem.name)
+            if on_progress:
+                on_progress(f"Processing: {wem.name}", 30)
+            if _pitch_shift_wem(wem, semitones, on_progress=on_progress):
                 shifted_count += 1
 
         if shifted_count == 0:
             raise RuntimeError("No audio files were successfully pitch-shifted")
 
-        print(f"Shifted {shifted_count} audio file(s)")
+        log.info("Shifted %d audio file(s)", shifted_count)
 
         # Update arrangement XMLs: set tuning to E standard
         for xml_path in sorted(tmp.rglob("*.xml")):
@@ -208,7 +220,9 @@ def retune_to_standard(psarc_path: str, output_path: str = "") -> str:
                 for i in range(6):
                     tuning_el.set(f"string{i}", "0")
                 tree.write(xml_path, xml_declaration=True, encoding="UTF-8")
-                print(f"Updated tuning: {xml_path.name}")
+                log.info("Updated tuning: %s", xml_path.name)
+                if on_progress:
+                    on_progress(f"Updated tuning: {xml_path.name}", 70)
 
         # Recompile SNGs from updated XMLs
         if RSCLI.exists():
@@ -229,7 +243,9 @@ def retune_to_standard(psarc_path: str, output_path: str = "") -> str:
                 stem = xml_path.stem
                 sng_path = tmp / "songs" / "bin" / "generic" / f"{stem}.sng"
                 if sng_path.exists():
-                    print(f"Recompiling SNG: {stem}")
+                    log.info("Recompiling SNG: %s", stem)
+                    if on_progress:
+                        on_progress(f"Recompiling SNG: {stem}", 80)
                     subprocess.run(
                         [str(RSCLI), "xml2sng", str(xml_path), str(sng_path)],
                         capture_output=True,
@@ -251,7 +267,9 @@ def retune_to_standard(psarc_path: str, output_path: str = "") -> str:
                 pass
 
         # Repack
-        print("Repacking PSARC...")
+        log.info("Repacking PSARC...")
+        if on_progress:
+            on_progress("Repacking PSARC...", 90)
         if not output_path:
             p = Path(psarc_path)
             stem = p.stem
@@ -260,7 +278,9 @@ def retune_to_standard(psarc_path: str, output_path: str = "") -> str:
             output_path = str(p.parent / f"{stem}_EStd_p.psarc")
 
         pack_psarc(str(tmp), output_path)
-        print(f"Created: {output_path}")
+        log.info("Created: %s", output_path)
+        if on_progress:
+            on_progress(f"Created: {output_path}", 95)
         return output_path
 
     finally:

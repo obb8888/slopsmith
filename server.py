@@ -25,16 +25,17 @@ from tunings import tuning_name
 import sloppak as sloppak_mod
 
 import concurrent.futures
+import contextvars
 import inspect
 import re
 import sqlite3
 import threading
 import time
-import traceback
 import uuid
 import warnings
 import xml.etree.ElementTree as ET
 
+import structlog
 from fastapi import Request
 
 app = FastAPI(title="Rocksmith Web")
@@ -112,7 +113,7 @@ def _run_janitor_hook(hook) -> None:
     try:
         result = hook()
     except Exception:
-        traceback.print_exc()
+        log.exception("janitor hook %r raised", hook)
         return
     if inspect.iscoroutine(result):
         # A coroutine slipped through the async-function guard (e.g. via a
@@ -121,7 +122,7 @@ def _run_janitor_hook(hook) -> None:
         try:
             result.close()
         except Exception:
-            traceback.print_exc()
+            log.exception("error closing coroutine from janitor hook %r", hook)
         warnings.warn(
             f"janitor hook {hook!r} returned a coroutine; "
             "hooks must be plain synchronous callables — "
@@ -866,7 +867,7 @@ def _background_scan():
     dlc = _get_dlc_dir()
     if not dlc:
         _scan_status = {**_SCAN_STATUS_INIT, "stage": "idle", "error": "DLC folder not configured"}
-        print("Scan: no DLC folder configured", flush=True)
+        log.warning("Scan: no DLC folder configured")
         return
 
     # Listing can fail on macOS without Full Disk Access, or on Docker if the
@@ -884,16 +885,16 @@ def _background_scan():
         msg = (f"Permission denied reading {dlc}. "
                "On macOS: grant Full Disk Access to the app in System Settings → Privacy & Security. "
                "With Docker: share this path in Docker Desktop → Settings → Resources → File Sharing.")
-        print(f"Scan failed: {msg} ({e})", flush=True)
+        log.error("Scan failed: %s (%s)", msg, e)
         _scan_status = {**_SCAN_STATUS_INIT, "stage": "error", "error": msg}
         return
     except OSError as e:
-        print(f"Scan failed listing {dlc}: {e}", flush=True)
+        log.error("Scan failed listing %s: %s", dlc, e)
         _scan_status = {**_SCAN_STATUS_INIT, "stage": "error", "error": f"Unable to list {dlc}: {e}"}
         return
 
     all_songs = psarcs + sloppaks
-    print(f"Scan: listed {len(psarcs)} PSARCs and {len(sloppaks)} sloppaks in {dlc}", flush=True)
+    log.info("Scan: listed %d PSARCs and %d sloppaks in %s", len(psarcs), len(sloppaks), dlc)
 
     def _rel(f: Path) -> str:
         # Store the path relative to the DLC root so sub-folders (e.g.
@@ -910,7 +911,7 @@ def _background_scan():
     # Clean up stale DB entries
     stale = meta_db.delete_missing(current_files)
     if stale:
-        print(f"Removed {stale} stale DB entries", flush=True)
+        log.info("Removed %d stale DB entries", stale)
 
     # Figure out which need scanning
     to_scan = []
@@ -921,17 +922,17 @@ def _background_scan():
 
     if not to_scan:
         _scan_status = {**_SCAN_STATUS_INIT, "stage": "complete"}
-        print(f"Scan: nothing new to scan ({len(all_songs)} songs, all cached)", flush=True)
+        log.info("Scan: nothing new to scan (%d songs, all cached)", len(all_songs))
         return
 
     _scan_status = {**_SCAN_STATUS_INIT, "running": True, "stage": "scanning", "total": len(to_scan)}
-    print(f"Library: {len(psarcs)} PSARCs + {len(sloppaks)} sloppaks, {len(all_songs) - len(to_scan)} cached, {len(to_scan)} to scan", flush=True)
+    log.info("Library: %d PSARCs + %d sloppaks, %d cached, %d to scan", len(psarcs), len(sloppaks), len(all_songs) - len(to_scan), len(to_scan))
 
     def _scan_one(item):
         f, stat = item
         # Per-file log so users running the server / desktop can see live
         # activity and distinguish a stuck scan from a slow one.
-        print(f"  scanning {f.name}", flush=True)
+        log.debug("scanning %s", f.name)
         meta = _extract_meta_for_file(f)
         return _rel(f), stat.st_mtime, stat.st_size, meta
 
@@ -943,11 +944,11 @@ def _background_scan():
                 name, mtime, size, meta = future.result()
                 meta_db.put(name, mtime, size, meta)
             except Exception as e:
-                print(f"  Failed: {fname}: {e}", flush=True)
+                log.warning("scan failed for %s: %s", fname, e)
             _scan_status["done"] += 1
             _scan_status["current"] = fname
 
-    print(f"Scan complete: {len(to_scan)} songs cached", flush=True)
+    log.info("Scan complete: %d songs cached", len(to_scan))
     _scan_status = {**_SCAN_STATUS_INIT, "stage": "complete"}
 
 
@@ -1057,7 +1058,7 @@ async def startup_events():
                     fut.result(timeout=60)
                 except concurrent.futures.TimeoutError:
                     _pid = getattr(fn, "_plugin_id", "unknown")
-                    print(f"[Plugin] WARNING: route registration for '{_pid}' timed out after 60 s", flush=True)
+                    log.warning("route registration for %r timed out after 60 s", _pid)
 
                     def _log_deferred(f: concurrent.futures.Future):
                         try:
@@ -1065,7 +1066,7 @@ async def startup_events():
                         except concurrent.futures.CancelledError:
                             return
                         if exc is not None:
-                            print(f"[Plugin] ERROR: deferred route registration for '{_pid}' raised: {exc}", flush=True)
+                            log.error("deferred route registration for %r raised: %s", _pid, exc)
 
                     fut.add_done_callback(_log_deferred)
                     raise  # propagate to load_plugins() so it emits plugin-error and skips "Loaded routes"
@@ -1098,8 +1099,7 @@ async def startup_events():
                 message="Plugin startup failed",
                 error=str(e),
             )
-            import traceback
-            traceback.print_exc()
+            log.exception("plugin startup failed")
 
     if _sync_mode:
         # Caller requested synchronous startup (e.g. test environment).
@@ -2074,6 +2074,7 @@ async def ws_retune(websocket: WebSocket, filename: str, target: str = "E Standa
     """Retune a song to a target tuning with real-time progress."""
     import asyncio
     await websocket.accept()
+    structlog.contextvars.bind_contextvars(ws_conn_id=uuid.uuid4().hex[:8])
 
     dlc = _get_dlc_dir()
     if not dlc:
@@ -2094,62 +2095,55 @@ async def ws_retune(websocket: WebSocket, filename: str, target: str = "E Standa
         await websocket.close()
         return
 
-    progress_queue = asyncio.Queue()
+    # Bounded queue: retune can emit many progress messages (one per WEM
+    # file processed plus stage milestones), so 256 is a generous ceiling
+    # even for large PSARC bundles.  When the consumer exits early
+    # (client disconnect), put_nowait raises QueueFull — _queue_put_safe
+    # catches it silently so the executor thread doesn't block or accumulate
+    # memory waiting for a consumer that will never drain the queue.
+    progress_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+    loop = asyncio.get_running_loop()
+
+    def _queue_put_safe(item, terminal=False) -> None:
+        try:
+            progress_queue.put_nowait(item)
+        except asyncio.QueueFull:
+            if terminal:
+                # Terminal done/error messages must reach the client.  Make
+                # room by discarding the oldest intermediate progress update.
+                try:
+                    progress_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    progress_queue.put_nowait(item)
+                except asyncio.QueueFull:
+                    pass  # should not happen after making room
+            # else: consumer gone (client disconnected); discard the update
 
     def _do_retune():
-        from retune import retune_to_standard, get_tuning
+        from retune import retune_to_standard
 
         def report(stage, pct):
-            progress_queue.put_nowait({"stage": stage, "progress": pct})
+            loop.call_soon_threadsafe(_queue_put_safe, {"stage": stage, "progress": pct})
 
         try:
+            # Only E Standard is supported; Drop D requires per-string pitch
+            # shifting which retune_to_standard() does not implement.
+            if target != "E Standard":
+                loop.call_soon_threadsafe(
+                    _queue_put_safe,
+                    {"error": f"Unsupported target tuning: {target!r}. Only 'E Standard' is supported."},
+                    True,
+                )
+                return
+
             report("Checking tuning...", 5)
-            offsets, uniform = get_tuning(str(psarc_path))
 
-            # Determine target offsets
-            if target == "Drop D":
-                target_offsets = [-2, 0, 0, 0, 0, 0]
-            else:
-                target_offsets = [0, 0, 0, 0, 0, 0]
-
-            # Check if already at target
-            if offsets == target_offsets:
-                progress_queue.put_nowait({"error": f"Already in {target}"})
-                return
-
-            # For uniform tunings (all same offset), shift everything to 0
-            # For drop tunings, check if the shift is uniform
-            shift = [target_offsets[i] - offsets[i] for i in range(6)]
-            if len(set(shift)) != 1:
-                progress_queue.put_nowait({"error": f"Cannot uniformly retune {offsets} to {target} — shift varies per string"})
-                return
-
-            semitones = shift[0]
-            report("Extracting PSARC...", 10)
-
-            import builtins
-            _orig_print = builtins.print
-            def _progress_print(*args, **kwargs):
-                msg = " ".join(str(a) for a in args)
-                if "Processing" in msg: report(msg, 30)
-                elif "Decoded" in msg: report(msg, 45)
-                elif "Shifted" in msg: report(msg, 60)
-                elif "Updated tuning" in msg: report(msg, 70)
-                elif "Recompiling" in msg: report(msg, 80)
-                elif "Repacking" in msg: report(msg, 90)
-                elif "Created" in msg: report(msg, 95)
-                _orig_print(*args, **kwargs)
-
-            builtins.print = _progress_print
-            try:
-                # Set custom output path based on target
-                suffix = "_EStd" if target == "E Standard" else "_DropD"
-                p = Path(psarc_path)
-                stem = p.stem.replace("_p", "")
-                out_path = str(p.parent / f"{stem}{suffix}_p.psarc")
-                result = retune_to_standard(str(psarc_path), output_path=out_path)
-            finally:
-                builtins.print = _orig_print
+            p = Path(psarc_path)
+            stem = p.stem.replace("_p", "")
+            out_path = str(p.parent / f"{stem}_EStd_p.psarc")
+            result = retune_to_standard(str(psarc_path), output_path=out_path, on_progress=report)
 
             # Cache metadata for new file
             new_path = Path(result)
@@ -2159,21 +2153,23 @@ async def ws_retune(websocket: WebSocket, filename: str, target: str = "E Standa
                     stat = new_path.stat()
                     meta_db.put(new_path.name, stat.st_mtime, stat.st_size, meta)
                 except Exception:
-                    pass
+                    log.debug("retune: failed to cache metadata for %s", new_path.name, exc_info=True)
 
-            progress_queue.put_nowait({
+            loop.call_soon_threadsafe(_queue_put_safe, {
                 "done": True, "progress": 100,
                 "stage": "Complete!",
                 "filename": new_path.name,
-            })
+            }, True)
 
+        except ValueError as e:
+            log.warning("retune rejected for %s: %s", filename, e)
+            loop.call_soon_threadsafe(_queue_put_safe, {"error": str(e)}, True)
         except Exception as e:
-            import traceback
-            traceback.print_exc()
-            progress_queue.put_nowait({"error": str(e)})
+            log.exception("retune failed for %s", filename)
+            loop.call_soon_threadsafe(_queue_put_safe, {"error": str(e)}, True)
 
-    loop = asyncio.get_event_loop()
-    build_task = loop.run_in_executor(None, _do_retune)
+    _ctx = contextvars.copy_context()
+    build_task = loop.run_in_executor(None, lambda: _ctx.run(_do_retune))
 
     try:
         while True:
@@ -2406,6 +2402,7 @@ def serve_sloppak_file(filename: str, rel_path: str):
 async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1):
     """Stream song data for the highway renderer over WebSocket."""
     await websocket.accept()
+    structlog.contextvars.bind_contextvars(ws_conn_id=uuid.uuid4().hex[:8])
 
     dlc = _get_dlc_dir()
     if not dlc:
@@ -2439,18 +2436,21 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
         keepalive_task = asyncio.create_task(_send_keepalives())
 
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
+            _ctx = contextvars.copy_context()
             if is_slop:
                 SLOPPAK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
                 loaded_slop = await loop.run_in_executor(
                     None,
-                    lambda: sloppak_mod.load_song(filename, dlc, SLOPPAK_CACHE_DIR),
+                    lambda: _ctx.run(sloppak_mod.load_song, filename, dlc, SLOPPAK_CACHE_DIR),
                 )
                 song = loaded_slop.song
                 tmp = str(loaded_slop.source_dir)
                 owns_tmp = False
             else:
-                tmp, song, owns_tmp = await loop.run_in_executor(None, lambda: _get_or_extract(filename, psarc_path))
+                tmp, song, owns_tmp = await loop.run_in_executor(
+                    None, lambda: _ctx.run(_get_or_extract, filename, psarc_path)
+                )
         finally:
             _keepalive_active = False
             keepalive_task.cancel()
@@ -2533,9 +2533,7 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
                     shutil.copy2(audio_path, audio_dest)
                     audio_url = f"/audio/audio_{audio_id}{ext}"
                 except Exception as e:
-                    print(f"Audio conversion failed: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    log.exception("audio conversion failed for %s", audio_id)
                     audio_error = f"Audio conversion failed: {e}"
 
             # Clean up old audio cache files (keep max 100)
@@ -2811,8 +2809,7 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
             pass
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        log.exception("highway_ws unhandled error for %s", filename)
         try:
             await websocket.send_json({"error": str(e)})
             await websocket.close()

@@ -41,8 +41,12 @@ the test-only inverse is the spec's source of truth when reading
 this alongside the parser.
 """
 
+import logging
 import struct
 import zlib
+from pathlib import Path
+
+log = logging.getLogger("slopsmith.lib.sng_vocals")
 
 try:
     from Crypto.Cipher import AES
@@ -83,7 +87,8 @@ def parse_vocals_sng(path: str, platform: str = "pc") -> list[dict]:
         raw = f.read()
     try:
         body = _decrypt_sng(raw, platform)
-    except Exception:
+    except Exception as e:
+        log.debug("sng_vocals: SNG decrypt failed for %s: %s", Path(path).name, e)
         return []
 
     # Vocals SNG layout: four empty u32 section counts (beats/phrases/

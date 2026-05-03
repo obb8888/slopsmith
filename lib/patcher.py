@@ -16,12 +16,15 @@ import os
 import sys
 import shutil
 import json
+import logging
 import re
 import argparse
 import tempfile
 import hashlib
 from pathlib import Path
 from glob import glob
+
+log = logging.getLogger("slopsmith.lib.patcher")
 
 from Crypto.Cipher import AES
 
@@ -233,10 +236,10 @@ def patch_psarc(input_path, new_app_id, output_dir=None, copy_to_dlc=True):
     """Unpack a PSARC, patch App IDs, repack, and optionally copy to dlc folder."""
     input_path = Path(input_path)
     if not input_path.exists():
-        print(f"  File not found: {input_path}")
+        log.warning("File not found: %s", input_path)
         return False
 
-    print(f"Processing: {input_path.name}")
+    log.info("Processing: %s", input_path.name)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
@@ -245,7 +248,7 @@ def patch_psarc(input_path, new_app_id, output_dir=None, copy_to_dlc=True):
         try:
             unpack_psarc(input_path, extract_dir)
         except Exception as e:
-            print(f"  Failed to unpack: {e}")
+            log.warning("Failed to unpack %s: %s", input_path.name, e)
             return False
 
         patched_count = 0
@@ -255,7 +258,7 @@ def patch_psarc(input_path, new_app_id, output_dir=None, copy_to_dlc=True):
             if content in CDLC_APP_IDS:
                 appid_file.write_text(new_app_id)
                 patched_count += 1
-                print(f"  Patched appid: {content} -> {new_app_id}")
+                log.debug("Patched appid: %s -> %s", content, new_app_id)
 
         for json_file in extract_dir.rglob("*.json"):
             content = json_file.read_text()
@@ -265,7 +268,7 @@ def patch_psarc(input_path, new_app_id, output_dir=None, copy_to_dlc=True):
             if new_content != content:
                 json_file.write_text(new_content)
                 patched_count += 1
-                print(f"  Patched manifest: {json_file.name}")
+                log.debug("Patched manifest: %s", json_file.name)
 
         for hsan_file in extract_dir.rglob("*.hsan"):
             content = hsan_file.read_text()
@@ -275,14 +278,14 @@ def patch_psarc(input_path, new_app_id, output_dir=None, copy_to_dlc=True):
             if new_content != content:
                 hsan_file.write_text(new_content)
                 patched_count += 1
-                print(f"  Patched hsan: {hsan_file.name}")
+                log.debug("Patched hsan: %s", hsan_file.name)
 
         if patched_count == 0:
-            print(f"  No App ID references found (may already be patched)")
+            log.info("No App ID references found in %s (may already be patched)", input_path.name)
             if copy_to_dlc:
                 dest = DLC_DIR / input_path.name
                 shutil.copy2(input_path, dest)
-                print(f"  Copied as-is to: {dest}")
+                log.info("Copied as-is to: %s", dest)
             return True
 
         try:
@@ -292,16 +295,16 @@ def patch_psarc(input_path, new_app_id, output_dir=None, copy_to_dlc=True):
             if copy_to_dlc:
                 dest = DLC_DIR / input_path.name
                 shutil.copy2(output_path, dest)
-                print(f"  Patched and copied to: {dest}")
+                log.info("Patched and copied to: %s", dest)
             elif output_dir:
                 dest = Path(output_dir) / input_path.name
                 shutil.copy2(output_path, dest)
-                print(f"  Patched and saved to: {dest}")
+                log.info("Patched and saved to: %s", dest)
 
-            print(f"  Done! ({patched_count} files patched)")
+            log.info("Done! (%d files patched)", patched_count)
             return True
         except Exception as e:
-            print(f"  Failed to repack: {e}")
+            log.warning("Failed to repack %s: %s", input_path.name, e)
             return False
 
 
@@ -328,10 +331,11 @@ def main():
                 else:
                     failed += 1
             else:
-                print(f"Skipping (not a .psarc file): {f}")
+                log.warning("Skipping (not a .psarc file): %s", f)
 
-    print(f"\nDone: {success} patched, {failed} failed")
+    log.info("Done: %d patched, %d failed", success, failed)
 
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     main()
