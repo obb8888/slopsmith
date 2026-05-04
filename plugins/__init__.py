@@ -638,23 +638,22 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                 this_is_bundled = _is_bundled(plugin_dir, manifest)
                 kept_is_bundled = _is_bundled(kept[1], kept[2]) if kept else False
                 if this_is_bundled and not kept_is_bundled:
-                    # The discarded copy is a bundled core plugin and the
-                    # kept copy is user-installed — an intentional override.
-                    # This fires whether the user copy lives in
-                    # SLOPSMITH_PLUGINS_DIR or was cloned directly into
-                    # plugins/ alongside the bundled copy.
+                    # The incoming copy is the canonical bundled plugin; the
+                    # already-kept copy is user-installed (SLOPSMITH_PLUGINS_DIR
+                    # or cloned directly into plugins/). Bundled always wins —
+                    # evict the user copy and fall through to register the
+                    # bundled version instead.
                     log.warning(
-                        "Bundled plugin %r at %s is being overridden by user-installed copy at %s. "
-                        "Remove the user copy to use the bundled version.",
-                        plugin_id, plugin_dir, kept[1] if kept else "(unknown)",
+                        "User-installed copy of bundled plugin %r at %s ignored; "
+                        "using bundled version at %s.",
+                        plugin_id, kept[1] if kept else "(unknown)", plugin_dir,
                     )
-                    # Stash a flag on the kept manifest so the frontend
-                    # plugin-list can render a "Overriding bundled core
-                    # plugin" badge — visible signal of the active
-                    # override matching the log line.
-                    if kept:
-                        kept[2]["__overrides_bundled"] = True
-                    continue
+                    plugin_load_specs[:] = [
+                        s for s in plugin_load_specs if s[0] != plugin_id
+                    ]
+                    loaded_ids.discard(plugin_id)
+                    loaded_specs_by_id.pop(plugin_id, None)
+                    # No `continue` — fall through to register the bundled copy.
                 elif this_is_bundled and kept_is_bundled:
                     # Two bundled plugins share an id — shouldn't happen in a
                     # well-maintained tree, but emit a clear warning so it
@@ -666,24 +665,13 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                     continue
                 elif kept_is_bundled:
                     # A non-bundled (user) copy encountered after an already-kept
-                    # bundled copy. The user copy should win regardless of sort
-                    # order — evict the bundled copy and fall through to register
-                    # the user copy in its place.
+                    # bundled copy. Bundled always wins — discard the user copy.
                     log.warning(
-                        "Bundled plugin %r at %s is being overridden by user-installed copy at %s. "
-                        "Remove the user copy to use the bundled version.",
-                        plugin_id, kept[1] if kept else "(unknown)", plugin_dir,
+                        "User-installed copy of bundled plugin %r at %s ignored; "
+                        "using bundled version at %s.",
+                        plugin_id, plugin_dir, kept[1] if kept else "(unknown)",
                     )
-                    manifest["__overrides_bundled"] = True
-                    # Remove the bundled copy from the to-be-loaded list and
-                    # tracking structures so the user copy can be registered.
-                    plugin_load_specs[:] = [
-                        s for s in plugin_load_specs if s[0] != plugin_id
-                    ]
-                    loaded_ids.discard(plugin_id)
-                    loaded_specs_by_id.pop(plugin_id, None)
-                    # No `continue` — fall through to the normal registration
-                    # code below to add this user copy.
+                    continue
                 else:
                     log.warning("Skipping duplicate plugin %r from %s", plugin_id, plugins_base_dir)
                     continue
