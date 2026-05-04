@@ -7,7 +7,9 @@ A self-contained web application for browsing, playing, and practicing Rocksmith
 > **Looking for a desktop app?** [Slopsmith Desktop](https://github.com/byrongamatos/slopsmith-desktop) is a standalone native app for non-technical users — no Docker required. It includes everything in the web version plus a built-in audio engine with VST3/AU/LV2 plugin hosting, Neural Amp Modeler (NAM) for amp simulation, cabinet IR loading, and automatic tone switching that changes your signal chain as tones change during a song.
 
 ![Library](docs/library.png)
-![Player](docs/player.png)
+![3D Highway Player](docs/player-3d.jpg)
+
+> The screenshot above shows the **3D Highway** — a bundled visualization plugin selectable from the viz picker, featuring depth-aware camera, lighting, and per-string lane glow. The **Classic 2D Highway** is also available in the picker.
 
 ## Features
 
@@ -21,7 +23,7 @@ A self-contained web application for browsing, playing, and practicing Rocksmith
 - **Retune to E Standard** — pitch-shift songs in Eb/D/C#/C Standard to E Standard with one click
 
 ### Note Highway Player
-A real-time canvas-based note highway that renders Rocksmith arrangements as they would appear in the game.
+A real-time note highway that renders Rocksmith arrangements as they would appear in the game. Bundled visualization options include a 3D highway with depth-aware camera, lighting, and per-string lane glow, and a classic 2D highway selectable from the visualization picker.
 
 **Note rendering:**
 - Fret-positioned notes with string colors (red, orange, blue, orange, green, purple)

@@ -551,6 +551,36 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
         sys.path.insert(0, pip_target)
 
     loaded_ids = set()
+    # id → (plugin_id, plugin_dir, manifest) for the *kept* copy of each
+    # plugin id. Used by the duplicate-skip path to log a useful
+    # "user copy at X overriding bundled core plugin at Y" message
+    # instead of a generic "skipping duplicate" line. Mirrors loaded_ids
+    # in lifetime; both are local to this discovery pass.
+    loaded_specs_by_id: dict[str, tuple] = {}
+
+    def _is_bundled(pdir: Path, mf: dict) -> bool:
+        """Return True iff pdir is the real in-tree bundled core plugin.
+
+        Requires ALL THREE of:
+        - Located directly in PLUGINS_DIR (pdir.parent == PLUGINS_DIR)
+        - Manifest carries ``"bundled": true``
+        - Directory name matches the plugin id (pdir.name == mf.get("id"))
+
+        The directory-name check distinguishes the real in-tree copy from a
+        verbatim user copy placed in plugins/ under a different folder name
+        but still carrying ``"bundled": true`` from the source manifest.
+        Neither the directory location alone nor the manifest field alone is
+        sufficient — a user plugin cloned into plugins/ would pass the first
+        check, and a user plugin could forge the second. The name check ties
+        the directory to the specific plugin id so only the canonical
+        ``plugins/<id>/`` location passes all three.
+        """
+        return (
+            pdir.parent == PLUGINS_DIR
+            and bool(mf.get("bundled"))
+            and pdir.name == mf.get("id")
+        )
+
     # Two-pass discovery so we can warn about cross-plugin module-name
     # collisions BEFORE any plugin's setup runs (slopsmith#33). The
     # first pass collects (plugin_id, plugin_dir, manifest) tuples in
@@ -591,10 +621,75 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                 # for empty strings).
                 continue
             if plugin_id in loaded_ids:
-                log.warning("Skipping duplicate plugin %r from %s", plugin_id, plugins_base_dir)
-                continue
+                # Quiet shadowing: when a user-installed copy beats a
+                # bundled copy (or vice versa), the duplicate-skip is
+                # the override path users explicitly want — phrase the
+                # log so it's obvious which copy is active and why,
+                # rather than the generic "Skipping duplicate".
+                # `loaded_specs_by_id` records the kept copy; this
+                # branch is the discarded one. Slopsmith#160 uses this
+                # for the plugin-list UI marker that shows a banner
+                # when a bundled plugin has been overridden.
+                kept = loaded_specs_by_id.get(plugin_id)
+                # Bundled-ness requires ALL THREE: the in-tree PLUGINS_DIR
+                # location, the manifest's ``"bundled": true`` flag, AND
+                # the directory name matching the manifest id. See the
+                # ``_is_bundled`` helper defined above for the full contract.
+                this_is_bundled = _is_bundled(plugin_dir, manifest)
+                kept_is_bundled = _is_bundled(kept[1], kept[2]) if kept else False
+                if this_is_bundled and not kept_is_bundled:
+                    # The discarded copy is a bundled core plugin and the
+                    # kept copy is user-installed — an intentional override.
+                    # This fires whether the user copy lives in
+                    # SLOPSMITH_PLUGINS_DIR or was cloned directly into
+                    # plugins/ alongside the bundled copy.
+                    log.warning(
+                        "Bundled plugin %r at %s is being overridden by user-installed copy at %s. "
+                        "Remove the user copy to use the bundled version.",
+                        plugin_id, plugin_dir, kept[1] if kept else "(unknown)",
+                    )
+                    # Stash a flag on the kept manifest so the frontend
+                    # plugin-list can render a "Overriding bundled core
+                    # plugin" badge — visible signal of the active
+                    # override matching the log line.
+                    if kept:
+                        kept[2]["__overrides_bundled"] = True
+                    continue
+                elif this_is_bundled and kept_is_bundled:
+                    # Two bundled plugins share an id — shouldn't happen in a
+                    # well-maintained tree, but emit a clear warning so it
+                    # doesn't pass silently.
+                    log.warning(
+                        "Skipping duplicate bundled plugin %r at %s (already registered from %s)",
+                        plugin_id, plugin_dir, kept[1] if kept else "(unknown)",
+                    )
+                    continue
+                elif kept_is_bundled:
+                    # A non-bundled (user) copy encountered after an already-kept
+                    # bundled copy. The user copy should win regardless of sort
+                    # order — evict the bundled copy and fall through to register
+                    # the user copy in its place.
+                    log.warning(
+                        "Bundled plugin %r at %s is being overridden by user-installed copy at %s. "
+                        "Remove the user copy to use the bundled version.",
+                        plugin_id, kept[1] if kept else "(unknown)", plugin_dir,
+                    )
+                    manifest["__overrides_bundled"] = True
+                    # Remove the bundled copy from the to-be-loaded list and
+                    # tracking structures so the user copy can be registered.
+                    plugin_load_specs[:] = [
+                        s for s in plugin_load_specs if s[0] != plugin_id
+                    ]
+                    loaded_ids.discard(plugin_id)
+                    loaded_specs_by_id.pop(plugin_id, None)
+                    # No `continue` — fall through to the normal registration
+                    # code below to add this user copy.
+                else:
+                    log.warning("Skipping duplicate plugin %r from %s", plugin_id, plugins_base_dir)
+                    continue
             loaded_ids.add(plugin_id)
             plugin_load_specs.append((plugin_id, plugin_dir, manifest))
+            loaded_specs_by_id[plugin_id] = (plugin_id, plugin_dir, manifest)
 
     # Warn before loading so authors see the message even if a colliding
     # plugin's setup itself blows up later in the loop.
@@ -728,6 +823,14 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
             # role; plugin is still loaded and scripts run, it just
             # doesn't show up in role-specific UIs. See slopsmith#36.
             "type": manifest.get("type"),
+            "overrides_bundled": bool(manifest.get("__overrides_bundled")),
+            # Uses the same _is_bundled() helper as the duplicate-skip path.
+            # See the helper's docstring for the three-part check that prevents
+            # user-installed plugins (cloned into plugins/ or carrying a forged
+            # "bundled": true manifest field) from being misidentified as core.
+            # Surfaced in /api/plugins so the plugin-list UI can render a
+            # 'Bundled' badge next to the plugin name in the settings collapsible.
+            "bundled": _is_bundled(plugin_dir, manifest),
             "has_screen": bool(manifest.get("screen")),
             "has_script": bool(manifest.get("script")),
             "has_settings": bool(manifest.get("settings")),
@@ -826,6 +929,18 @@ def register_plugin_api(app: FastAPI):
                 # work via identity comparison; absent is treated as
                 # "no declared role".
                 "type": p.get("type"),
+                # `bundled` is reserved metadata flagging plugins that
+                # ship with the default container image (slopsmith#160).
+                # Surfaced in /api/plugins so the plugin-list UI can
+                # render a "Bundled" badge (lock icon) next to the
+                # plugin name in the settings collapsible.
+                "bundled": p.get("bundled", False),
+                # True when this user-installed copy is shadowing a
+                # bundled copy of the same id. Surfaced via the API so
+                # the plugin-list UI can render an "Overriding bundled
+                # core plugin" badge — visible signal of the active
+                # override matching the warning in the server log.
+                "overrides_bundled": p.get("overrides_bundled", False),
                 "has_screen": p["has_screen"],
                 "has_script": p["has_script"],
                 "has_settings": p["has_settings"],

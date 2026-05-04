@@ -860,6 +860,10 @@ def test_slopsmith_plugins_dir_takes_precedence_over_bundled(
             "    app.state.origin = 'bundled'\n"
         ),
     )
+    # Mark the in-tree plugin as bundled — required for override detection.
+    (bundled_dir / "highway_3d" / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "highway_3d", "routes": "routes.py", "bundled": True})
+    )
 
     # Simulate a user-installed plugins directory (SLOPSMITH_PLUGINS_DIR).
     user_dir = tmp_path / "user"
@@ -891,8 +895,488 @@ def test_slopsmith_plugins_dir_takes_precedence_over_bundled(
     # Exactly one highway_3d entry registered.
     hw3d_entries = [p for p in plugins.LOADED_PLUGINS if p["id"] == "highway_3d"]
     assert len(hw3d_entries) == 1
-    # The loader emitted a duplicate-skip warning for the bundled copy.
-    assert "Skipping duplicate plugin 'highway_3d'" in caplog.text
+    # The loader emits the bundled-override warning.
+    assert (
+        "Bundled plugin 'highway_3d'" in caplog.text
+        and "overridden by user-installed copy" in caplog.text
+    )
+
+
+def test_bundled_plugin_overridden_by_user_copy_logs_warning_and_sets_flag(
+    tmp_path, reset_plugin_state, monkeypatch, caplog
+):
+    """When a user-installed copy shadows a manifest-bundled plugin the loader
+    emits the specific override warning and stamps ``__overrides_bundled`` on the
+    kept (user) copy so the frontend can render the amber badge.
+    """
+    plugins = reset_plugin_state
+
+    # In-tree bundled plugin — plugin.json carries ``"bundled": true``.
+    bundled_dir = tmp_path / "bundled"
+    bundled_dir.mkdir()
+    plugin_dir = bundled_dir / "highway_3d"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "3D Highway", "bundled": True})
+    )
+
+    # User-installed copy with the same id in a differently-named directory
+    # (confirms the override is keyed on manifest id, not directory name).
+    user_dir = tmp_path / "user"
+    user_dir.mkdir()
+    user_plugin_dir = user_dir / "3dhighway"  # different directory name
+    user_plugin_dir.mkdir()
+    (user_plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "3D Highway (user)"})
+    )
+
+    monkeypatch.setenv("SLOPSMITH_PLUGINS_DIR", str(user_dir))
+
+    fake_app = type("FakeApp", (), {})()
+    saved_dir = plugins.PLUGINS_DIR
+    plugins.PLUGINS_DIR = bundled_dir
+    try:
+        with capture_logger(caplog, "slopsmith.plugins"):
+            plugins.load_plugins(fake_app, {})
+    finally:
+        plugins.PLUGINS_DIR = saved_dir
+
+    # Exactly one entry registered.
+    hw3d_entries = [p for p in plugins.LOADED_PLUGINS if p["id"] == "highway_3d"]
+    assert len(hw3d_entries) == 1
+
+    # The kept copy must be the user copy (user dir scanned first).
+    kept = hw3d_entries[0]
+    assert str(kept["_dir"]) == str(user_plugin_dir)
+
+    # The override flag must be stamped on the kept (user) copy.
+    assert kept.get("overrides_bundled") is True
+
+    # The bundled field must be False for the user copy.
+    assert kept.get("bundled") is False
+
+    # The loader must emit the specific override warning.
+    assert (
+        "Bundled plugin 'highway_3d'" in caplog.text
+        and "overridden by user-installed copy" in caplog.text
+    )
+
+
+def test_bundled_plugin_overridden_by_verbatim_copy_sets_flag(
+    tmp_path, reset_plugin_state, monkeypatch, caplog
+):
+    """A user who copies the in-tree bundled plugin verbatim (keeping
+    ``"bundled": true`` in their copy) still triggers the override warning
+    and gets ``overrides_bundled=True`` + ``bundled=False`` on the kept entry.
+
+    The user copy lives in ``SLOPSMITH_PLUGINS_DIR`` (not in-tree PLUGINS_DIR),
+    so the three-part ``_is_bundled()`` check — ``(in-tree directory) AND
+    manifest.get("bundled") AND (dir name == plugin id)`` — correctly
+    identifies the in-tree copy as the real bundled plugin and the user copy
+    as the override, even though the user copy also carries the
+    ``"bundled": true`` manifest field.
+    """
+    plugins = reset_plugin_state
+
+    # In-tree bundled plugin.
+    bundled_dir = tmp_path / "bundled"
+    bundled_dir.mkdir()
+    plugin_dir = bundled_dir / "highway_3d"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "3D Highway", "bundled": True})
+    )
+
+    # User copy that was copied verbatim from in-tree — still carries bundled=true.
+    user_dir = tmp_path / "user"
+    user_dir.mkdir()
+    user_plugin_dir = user_dir / "highway_3d_custom"
+    user_plugin_dir.mkdir()
+    (user_plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "3D Highway (custom)", "bundled": True})
+    )
+
+    monkeypatch.setenv("SLOPSMITH_PLUGINS_DIR", str(user_dir))
+
+    fake_app = type("FakeApp", (), {})()
+    saved_dir = plugins.PLUGINS_DIR
+    plugins.PLUGINS_DIR = bundled_dir
+    try:
+        with capture_logger(caplog, "slopsmith.plugins"):
+            plugins.load_plugins(fake_app, {})
+    finally:
+        plugins.PLUGINS_DIR = saved_dir
+
+    # Exactly one entry registered.
+    hw3d_entries = [p for p in plugins.LOADED_PLUGINS if p["id"] == "highway_3d"]
+    assert len(hw3d_entries) == 1
+
+    # The kept copy is the user copy (user dir scanned first).
+    kept = hw3d_entries[0]
+    assert str(kept["_dir"]) == str(user_plugin_dir)
+
+    # The override flag must be set even though the user copy also has bundled=true.
+    assert kept.get("overrides_bundled") is True
+
+    # bundled must be False — the kept copy is a user override, not a real
+    # in-tree bundled plugin, regardless of what its manifest claims.
+    assert kept.get("bundled") is False
+
+    # The loader emits the specific override warning.
+    assert (
+        "Bundled plugin 'highway_3d'" in caplog.text
+        and "overridden by user-installed copy" in caplog.text
+    )
+
+
+def test_bundled_plugin_overridden_by_copy_in_same_plugins_dir(
+    tmp_path, reset_plugin_state, caplog
+):
+    """A user who clones an override directly into ``plugins/`` (the documented
+    third-party install location) still gets the override warning and
+    ``overrides_bundled=True``.
+
+    Both plugins live under the same PLUGINS_DIR, so override detection cannot
+    use the directory parent alone. The three-part ``_is_bundled()`` check —
+    ``(in-tree dir) AND manifest.get("bundled") AND (dir name == plugin id)`` —
+    identifies the bundled copy, and the user copy (no ``"bundled"`` field, or
+    a different directory name) as the override.
+
+    Layout mirroring the canonical example from the PR description:
+      plugins/3dhighway/   ← user-installed fork (no "bundled" field)
+      plugins/highway_3d/  ← bundled core (has "bundled": true, dir name == id)
+
+    ``3dhighway`` sorts before ``highway_3d`` alphabetically and is kept;
+    ``highway_3d`` is the duplicate that should fire the override warning.
+    """
+    plugins = reset_plugin_state
+
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+
+    # User-installed fork — comes first alphabetically, will be kept.
+    user_plugin_dir = plugins_dir / "3dhighway"
+    user_plugin_dir.mkdir()
+    (user_plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "3D Highway (user fork)"})
+    )
+
+    # Bundled core — sorts after "3dhighway", will be the duplicate.
+    bundled_plugin_dir = plugins_dir / "highway_3d"
+    bundled_plugin_dir.mkdir()
+    (bundled_plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "3D Highway", "bundled": True})
+    )
+
+    fake_app = type("FakeApp", (), {})()
+    saved_dir = plugins.PLUGINS_DIR
+    plugins.PLUGINS_DIR = plugins_dir
+    try:
+        with capture_logger(caplog, "slopsmith.plugins"):
+            plugins.load_plugins(fake_app, {})
+    finally:
+        plugins.PLUGINS_DIR = saved_dir
+
+    hw3d_entries = [p for p in plugins.LOADED_PLUGINS if p["id"] == "highway_3d"]
+    assert len(hw3d_entries) == 1
+
+    # The kept copy must be the user fork (alphabetically first).
+    kept = hw3d_entries[0]
+    assert str(kept["_dir"]) == str(user_plugin_dir)
+
+    # Override flag and bundled=False on the kept user copy.
+    assert kept.get("overrides_bundled") is True
+    assert kept.get("bundled") is False
+
+    # The loader emits the specific override warning.
+    assert (
+        "Bundled plugin 'highway_3d'" in caplog.text
+        and "overridden by user-installed copy" in caplog.text
+    )
+
+
+def test_bundled_plugin_overridden_by_copy_in_same_plugins_dir_bundled_sorts_first(
+    tmp_path, reset_plugin_state, caplog
+):
+    """Override detection works even when the bundled directory sorts *before*
+    the user directory (i.e., the bundled copy is encountered first).
+
+    The user copy must still win regardless of alphabetical sort order.
+
+    Layout where bundled sorts before user:
+      plugins/highway_3d/   ← bundled core (has "bundled": true), sorts first
+      plugins/zzz-highway/  ← user-installed fork (no "bundled" field), sorts last
+    """
+    plugins = reset_plugin_state
+
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+
+    # Bundled core — sorts first alphabetically.
+    bundled_plugin_dir = plugins_dir / "highway_3d"
+    bundled_plugin_dir.mkdir()
+    (bundled_plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "3D Highway", "bundled": True})
+    )
+
+    # User-installed fork — sorts after "highway_3d", will be encountered second.
+    user_plugin_dir = plugins_dir / "zzz-highway"
+    user_plugin_dir.mkdir()
+    (user_plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "3D Highway (user fork)"})
+    )
+
+    fake_app = type("FakeApp", (), {})()
+    saved_dir = plugins.PLUGINS_DIR
+    plugins.PLUGINS_DIR = plugins_dir
+    try:
+        with capture_logger(caplog, "slopsmith.plugins"):
+            plugins.load_plugins(fake_app, {})
+    finally:
+        plugins.PLUGINS_DIR = saved_dir
+
+    hw3d_entries = [p for p in plugins.LOADED_PLUGINS if p["id"] == "highway_3d"]
+    assert len(hw3d_entries) == 1
+
+    # The user copy must win even though the bundled copy sorted first.
+    kept = hw3d_entries[0]
+    assert str(kept["_dir"]) == str(user_plugin_dir)
+
+    # Override flag and bundled=False on the kept user copy.
+    assert kept.get("overrides_bundled") is True
+    assert kept.get("bundled") is False
+
+    # The loader emits the specific override warning.
+    assert (
+        "Bundled plugin 'highway_3d'" in caplog.text
+        and "overridden by user-installed copy" in caplog.text
+    )
+
+
+def test_bundled_plugin_overridden_by_verbatim_copy_in_same_plugins_dir(
+    tmp_path, reset_plugin_state, caplog
+):
+    """A user who copies the bundled plugin *verbatim* (keeping ``"bundled": true``)
+    into ``plugins/`` under a **different directory name** is still correctly
+    identified as a user override, not a second bundled copy.
+
+    The three-part ``_is_bundled()`` check — in-tree directory, manifest field,
+    AND directory-name-matches-plugin-id — is what distinguishes the real core
+    copy from this verbatim clone.
+
+    Layout:
+      plugins/highway_3d/   ← bundled core (has "bundled": true, dir name == id)
+      plugins/zzz-highway/  ← verbatim user copy (has "bundled": true, dir name ≠ id)
+
+    ``highway_3d`` sorts before ``zzz-highway``; the bundled copy is encountered
+    first. When the user copy arrives it matches ``kept_is_bundled`` → the user
+    copy evicts the bundled one and is registered as the active plugin.
+    """
+    plugins = reset_plugin_state
+
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+
+    # Bundled core — dir name == plugin id, has "bundled": true.
+    bundled_plugin_dir = plugins_dir / "highway_3d"
+    bundled_plugin_dir.mkdir()
+    (bundled_plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "3D Highway", "bundled": True})
+    )
+
+    # Verbatim user copy — different dir name, but manifest is identical (including "bundled": true).
+    user_plugin_dir = plugins_dir / "zzz-highway"
+    user_plugin_dir.mkdir()
+    (user_plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "highway_3d", "name": "3D Highway", "bundled": True})
+    )
+
+    fake_app = type("FakeApp", (), {})()
+    saved_dir = plugins.PLUGINS_DIR
+    plugins.PLUGINS_DIR = plugins_dir
+    try:
+        with capture_logger(caplog, "slopsmith.plugins"):
+            plugins.load_plugins(fake_app, {})
+    finally:
+        plugins.PLUGINS_DIR = saved_dir
+
+    hw3d_entries = [p for p in plugins.LOADED_PLUGINS if p["id"] == "highway_3d"]
+    assert len(hw3d_entries) == 1
+
+    # The user copy (zzz-highway) must win even though it also carries "bundled": true.
+    kept = hw3d_entries[0]
+    assert str(kept["_dir"]) == str(user_plugin_dir)
+
+    # override flag set; bundled must be False (dir name "zzz-highway" ≠ "highway_3d").
+    assert kept.get("overrides_bundled") is True
+    assert kept.get("bundled") is False
+
+    # Override warning must be emitted.
+    assert (
+        "Bundled plugin 'highway_3d'" in caplog.text
+        and "overridden by user-installed copy" in caplog.text
+    )
+
+
+def test_bundled_flag_requires_both_in_tree_directory_and_manifest_field(
+    tmp_path, reset_plugin_state, monkeypatch
+):
+    """``bundled`` requires ALL THREE: in-tree PLUGINS_DIR location, the
+    manifest's ``"bundled": true`` field, AND the directory name matching the
+    plugin id.
+
+    - In-tree plugin, dir name == id, ``"bundled": true`` → ``bundled: true``.
+    - In-tree plugin, dir name == id, no ``"bundled"`` field → ``bundled: false``
+      (user-installed plugin cloned into plugins/).
+    - In-tree plugin, dir name ≠ id, ``"bundled": true`` → ``bundled: false``
+      (verbatim user copy under a different folder name).
+    - User-dir plugin, ``"bundled": true`` → ``bundled: false``
+      (not in-tree; manifest field alone is not sufficient).
+
+    This ensures a user-installed plugin cannot forge core status by adding
+    ``"bundled": true`` to its own plugin.json, while correctly identifying
+    legitimate in-tree bundled plugins.
+    """
+    plugins = reset_plugin_state
+
+    bundled_dir = tmp_path / "bundled"
+    bundled_dir.mkdir()
+    # In-tree plugin WITH "bundled": true AND dir name == id — the real bundled core plugin.
+    (bundled_dir / "real_core").mkdir()
+    (bundled_dir / "real_core" / "plugin.json").write_text(
+        json.dumps({"id": "real_core", "name": "Real Core Plugin", "bundled": True})
+    )
+    # In-tree plugin WITHOUT "bundled" field — a user plugin cloned into plugins/.
+    (bundled_dir / "user_in_tree").mkdir()
+    (bundled_dir / "user_in_tree" / "plugin.json").write_text(
+        json.dumps({"id": "user_in_tree", "name": "User Plugin (in plugins/)"})
+    )
+    # In-tree plugin WITH "bundled": true but dir name ≠ id — verbatim user copy
+    # of a bundled plugin placed under a different folder name.
+    (bundled_dir / "other_name").mkdir()
+    (bundled_dir / "other_name" / "plugin.json").write_text(
+        json.dumps({"id": "real_core_copy", "name": "Verbatim Copy", "bundled": True})
+    )
+
+    user_dir = tmp_path / "user"
+    user_dir.mkdir()
+    # User plugin in SLOPSMITH_PLUGINS_DIR that forges "bundled": true.
+    (user_dir / "fake_bundled").mkdir()
+    (user_dir / "fake_bundled" / "plugin.json").write_text(
+        json.dumps({"id": "fake_bundled", "name": "Fake Bundled", "bundled": True})
+    )
+
+    monkeypatch.setenv("SLOPSMITH_PLUGINS_DIR", str(user_dir))
+
+    fake_app = type("FakeApp", (), {})()
+    saved_dir = plugins.PLUGINS_DIR
+    plugins.PLUGINS_DIR = bundled_dir
+    try:
+        plugins.load_plugins(fake_app, {})
+    finally:
+        plugins.PLUGINS_DIR = saved_dir
+
+    by_id = {p["id"]: p for p in plugins.LOADED_PLUGINS}
+
+    # In-tree plugin with "bundled": true AND dir name == id → bundled=True.
+    assert by_id["real_core"]["bundled"] is True
+    assert by_id["real_core"]["overrides_bundled"] is False
+
+    # In-tree plugin without "bundled" field → bundled=False (user clone in plugins/).
+    assert by_id["user_in_tree"]["bundled"] is False
+    assert by_id["user_in_tree"]["overrides_bundled"] is False
+
+    # In-tree plugin with "bundled": true but dir name ≠ id → bundled=False.
+    # (verbatim copy under a different folder; dir name "other_name" ≠ id "real_core_copy")
+    assert by_id["real_core_copy"]["bundled"] is False
+    assert by_id["real_core_copy"]["overrides_bundled"] is False
+
+    # Plugin from user dir with "bundled": true → bundled=False (manifest field alone insufficient).
+    assert by_id["fake_bundled"]["bundled"] is False
+    assert by_id["fake_bundled"]["overrides_bundled"] is False
+
+
+
+def test_bundled_and_overrides_bundled_returned_by_api(tmp_path, reset_plugin_state):
+    """GET /api/plugins must include ``bundled`` and ``overrides_bundled``
+    boolean fields for each plugin.
+
+    - A plugin loaded from a manifest with ``"bundled": true`` must surface
+      ``bundled: true, overrides_bundled: false``.
+    - A user copy that shadows a bundled plugin must surface
+      ``bundled: false, overrides_bundled: true``.
+    - A plain user plugin with no bundled interaction must surface
+      ``bundled: false, overrides_bundled: false``.
+    """
+    plugins_mod = reset_plugin_state
+
+    plugin_dir = tmp_path / "dummy"
+    plugin_dir.mkdir()
+
+    # Bundled plugin entry.
+    plugins_mod.LOADED_PLUGINS.append({
+        "id": "core_viz",
+        "name": "Core Viz",
+        "nav": None,
+        "type": None,
+        "bundled": True,
+        "overrides_bundled": False,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": False,
+        "has_tour": False,
+        "_dir": plugin_dir,
+        "_manifest": {},
+    })
+
+    # User copy overriding a bundled plugin.
+    plugins_mod.LOADED_PLUGINS.append({
+        "id": "highway_3d",
+        "name": "3D Highway (user)",
+        "nav": None,
+        "type": None,
+        "bundled": False,
+        "overrides_bundled": True,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": False,
+        "has_tour": False,
+        "_dir": plugin_dir,
+        "_manifest": {},
+    })
+
+    # Plain user plugin.
+    plugins_mod.LOADED_PLUGINS.append({
+        "id": "my_plugin",
+        "name": "My Plugin",
+        "nav": None,
+        "type": None,
+        "bundled": False,
+        "overrides_bundled": False,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": False,
+        "has_tour": False,
+        "_dir": plugin_dir,
+        "_manifest": {},
+    })
+
+    client = _make_api_client(plugins_mod)
+    try:
+        r = client.get("/api/plugins")
+        assert r.status_code == 200
+        ids = {p["id"]: p for p in r.json()}
+
+        assert ids["core_viz"]["bundled"] is True
+        assert ids["core_viz"]["overrides_bundled"] is False
+
+        assert ids["highway_3d"]["bundled"] is False
+        assert ids["highway_3d"]["overrides_bundled"] is True
+
+        assert ids["my_plugin"]["bundled"] is False
+        assert ids["my_plugin"]["overrides_bundled"] is False
+    finally:
+        client.close()
 
 
 # ── progress_cb tests ─────────────────────────────────────────────────────────

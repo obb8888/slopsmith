@@ -3963,9 +3963,55 @@ async function loadPlugins() {
                 // .plugin-settings-summary class hides the browser's native
                 // disclosure triangle (see style.css) so only our chevron shows.
                 summary.className = 'plugin-settings-summary cursor-pointer select-none px-4 py-3 text-sm font-medium text-gray-300 hover:bg-dark-700/70 transition flex items-center justify-between';
+                const labelWrap = document.createElement('span');
+                labelWrap.className = 'flex items-center gap-2';
                 const labelSpan = document.createElement('span');
                 labelSpan.textContent = plugin.name || plugin.id;
-                summary.appendChild(labelSpan);
+                labelWrap.appendChild(labelSpan);
+                // "Bundled" marker (slopsmith#160). Visually distinguishes
+                // plugins that ship with the default container image from
+                // user-installed ones so users don't try to remove a core
+                // plugin via the manage-plugin flow and brick a feature
+                // that's expected to "just work".
+                if (plugin.bundled) {
+                    const bundledDesc = 'This plugin ships with Slopsmith core and is expected to be present.';
+                    const badge = document.createElement('span');
+                    badge.className = 'inline-flex items-center gap-1 text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded border border-purple-400/30 bg-purple-500/10 text-purple-300';
+                    badge.title = bundledDesc;
+                    badge.setAttribute('aria-label', 'Bundled — ' + bundledDesc);
+                    badge.setAttribute('role', 'img');
+                    badge.innerHTML = `
+                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M12 11c1.657 0 3-1.343 3-3V6a3 3 0 10-6 0v2c0 1.657 1.343 3 3 3zM6 11h12a2 2 0 012 2v6a2 2 0 01-2 2H6a2 2 0 01-2-2v-6a2 2 0 012-2z"/>
+                        </svg>
+                        Bundled
+                    `;
+                    labelWrap.appendChild(badge);
+                } else if (plugin.overrides_bundled) {
+                    // User-installed copy is shadowing a bundled core
+                    // version of this plugin (slopsmith#160). Surface
+                    // the override so users understand why a "bundled"
+                    // marker isn't visible — and so they can decide
+                    // whether to remove the user copy and let the
+                    // bundled version take over. Mirrors the warning
+                    // line the plugin loader writes at startup.
+                    const overrideDesc = 'A user-installed copy of this plugin is shadowing the bundled core version. Check the server startup log for the exact path, remove the user copy and restart to use the bundled build instead.';
+                    const badge = document.createElement('span');
+                    badge.className = 'inline-flex items-center gap-1 text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded border border-amber-400/30 bg-amber-500/10 text-amber-300';
+                    badge.title = overrideDesc;
+                    badge.setAttribute('aria-label', 'Overrides bundled — ' + overrideDesc);
+                    badge.setAttribute('role', 'img');
+                    badge.innerHTML = `
+                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M12 9v2m0 4h.01M5.07 19h13.86c1.54 0 2.5-1.67 1.73-3L13.73 4c-.77-1.33-2.69-1.33-3.46 0L3.34 16c-.77 1.33.19 3 1.73 3z"/>
+                        </svg>
+                        Overrides bundled
+                    `;
+                    labelWrap.appendChild(badge);
+                }
+                summary.appendChild(labelWrap);
                 // Chevron icon — built via setAttributeNS so the SVG sits in
                 // the SVG namespace and renders correctly. Plugin label is
                 // appended as text above so manifest values can't inject HTML.
@@ -4012,6 +4058,33 @@ async function loadPlugins() {
                     newScript.textContent = oldScript.textContent;
                     oldScript.parentNode.replaceChild(newScript, oldScript);
                 });
+                // Overrides-bundled notice — injected after settings HTML so
+                // it isn't wiped by innerHTML. Rendered as visible text so
+                // all users (including touch and keyboard-only) see the
+                // explanation without needing a hover tooltip.
+                if (plugin.overrides_bundled) {
+                    const notice = document.createElement('div');
+                    notice.className = 'flex items-start gap-2 rounded p-3 text-xs bg-amber-500/10 border border-amber-400/30 text-amber-300';
+                    notice.setAttribute('role', 'status');
+                    const noticeSvgNS = 'http://www.w3.org/2000/svg';
+                    const noticeSvg = document.createElementNS(noticeSvgNS, 'svg');
+                    noticeSvg.setAttribute('class', 'w-4 h-4 shrink-0 mt-0.5');
+                    noticeSvg.setAttribute('fill', 'none');
+                    noticeSvg.setAttribute('stroke', 'currentColor');
+                    noticeSvg.setAttribute('viewBox', '0 0 24 24');
+                    noticeSvg.setAttribute('aria-hidden', 'true');
+                    const noticePath = document.createElementNS(noticeSvgNS, 'path');
+                    noticePath.setAttribute('stroke-linecap', 'round');
+                    noticePath.setAttribute('stroke-linejoin', 'round');
+                    noticePath.setAttribute('stroke-width', '2');
+                    noticePath.setAttribute('d', 'M12 9v2m0 4h.01M5.07 19h13.86c1.54 0 2.5-1.67 1.73-3L13.73 4c-.77-1.33-2.69-1.33-3.46 0L3.34 16c-.77 1.33.19 3 1.73 3z');
+                    noticeSvg.appendChild(noticePath);
+                    const noticeText = document.createElement('span');
+                    noticeText.textContent = 'A user-installed copy of this plugin is shadowing the bundled core version. Check the server startup log for the exact path; remove the user copy and restart to use the bundled build instead.';
+                    notice.appendChild(noticeSvg);
+                    notice.appendChild(noticeText);
+                    body.insertBefore(notice, body.firstChild);
+                }
             }
 
             // Load plugin JS
