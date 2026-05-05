@@ -509,7 +509,8 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
     """
 
     def _emit_progress(phase: str, message: str, plugin_id: str = "", loaded: int = 0,
-                       total: int = 0, error: str | None = None):
+                       total: int = 0, error: str | None = None,
+                       clear_error: bool = False):
         if not progress_cb:
             return
         try:
@@ -520,12 +521,19 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                 "loaded": loaded,
                 "total": total,
             }
-            # Omit the error key when there is no error so that downstream
-            # consumers using "status.error = event.error" don't accidentally
-            # clear a previously-reported plugin error on the next non-error
-            # progress event.
+            # Include the error key only when meaningful:
+            # - A non-null error string sets/updates the error field.
+            # - clear_error=True sends an explicit null to clear a
+            #   previously-reported error (e.g. bundled failure cleared
+            #   by a successful user-copy fallback). Downstream handlers
+            #   must check `"error" in event`, not `event.get("error") is
+            #   not None`, to receive the clear signal.
+            # - No error kwarg → key is omitted; downstream preserves
+            #   any previously-reported error across non-error events.
             if error is not None:
                 event["error"] = error
+            elif clear_error:
+                event["error"] = None
             progress_cb(event)
         except Exception:
             # Progress reporting must never break plugin startup.
@@ -557,6 +565,18 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
     # instead of a generic "skipping duplicate" line. Mirrors loaded_ids
     # in lifetime; both are local to this discovery pass.
     loaded_specs_by_id: dict[str, tuple] = {}
+    # Maps plugin_id → evicted user spec (plugin_id, plugin_dir, manifest).
+    # Populated when a bundled plugin evicts a user-installed copy. Used as
+    # a fallback: if the bundled copy later fails to load its routes, the
+    # user copy is restored so the server remains functional.
+    _pending_evictions: dict[str, tuple] = {}
+    # Maps plugin_id → set of sys.modules keys that were NEW during the
+    # failed bundled route load. Bundled routes may import helpers under
+    # bare names (e.g. `import helper`); these survive the namespaced
+    # _parent_pkg cleanup and would resolve to bundled code if the fallback
+    # plugin also uses bare imports. Purging them gives the fallback a
+    # clean import slate (Thread 1, review-4226783807).
+    _pending_eviction_stale_modules: dict[str, set] = {}
 
     def _is_bundled(pdir: Path, mf: dict) -> bool:
         """Return True iff pdir is the real in-tree bundled core plugin.
@@ -621,15 +641,10 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                 # for empty strings).
                 continue
             if plugin_id in loaded_ids:
-                # Quiet shadowing: when a user-installed copy beats a
-                # bundled copy (or vice versa), the duplicate-skip is
-                # the override path users explicitly want — phrase the
-                # log so it's obvious which copy is active and why,
-                # rather than the generic "Skipping duplicate".
-                # `loaded_specs_by_id` records the kept copy; this
-                # branch is the discarded one. Slopsmith#160 uses this
-                # for the plugin-list UI marker that shows a banner
-                # when a bundled plugin has been overridden.
+                # Duplicate id — pick a winner. Bundled plugins always win.
+                # `loaded_specs_by_id` records the already-seen copy; this
+                # is the new candidate. Use specific log messages so it's
+                # obvious which copy wins and why.
                 kept = loaded_specs_by_id.get(plugin_id)
                 # Bundled-ness requires ALL THREE: the in-tree PLUGINS_DIR
                 # location, the manifest's ``"bundled": true`` flag, AND
@@ -643,17 +658,32 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                     # or cloned directly into plugins/). Bundled always wins —
                     # evict the user copy and fall through to register the
                     # bundled version instead.
+                    #
+                    # Store the evicted spec as a potential fallback: if the
+                    # bundled copy later fails to load its routes, the server
+                    # restores this user copy so it keeps working.
+                    _pending_evictions[plugin_id] = kept
                     log.warning(
                         "User-installed copy of bundled plugin %r at %s ignored; "
                         "using bundled version at %s.",
                         plugin_id, kept[1] if kept else "(unknown)", plugin_dir,
                     )
-                    plugin_load_specs[:] = [
-                        s for s in plugin_load_specs if s[0] != plugin_id
-                    ]
-                    loaded_ids.discard(plugin_id)
-                    loaded_specs_by_id.pop(plugin_id, None)
-                    # No `continue` — fall through to register the bundled copy.
+                    # Replace the user copy's slot in-place so the bundled
+                    # copy inherits the same discovery position.  Removing and
+                    # re-appending would shift the bundled entry to the end of
+                    # plugin_load_specs, changing /api/plugins order and the
+                    # frontend playSong wrapper chain.
+                    _user_slot = next(
+                        (i for i, s in enumerate(plugin_load_specs) if s[0] == plugin_id),
+                        None,
+                    )
+                    _bundled_spec = (plugin_id, plugin_dir, manifest)
+                    if _user_slot is not None:
+                        plugin_load_specs[_user_slot] = _bundled_spec
+                    else:
+                        plugin_load_specs.append(_bundled_spec)
+                    loaded_specs_by_id[plugin_id] = _bundled_spec
+                    continue  # loaded_ids already contains plugin_id
                 elif this_is_bundled and kept_is_bundled:
                     # Two bundled plugins share an id — shouldn't happen in a
                     # well-maintained tree, but emit a clear warning so it
@@ -666,6 +696,12 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                 elif kept_is_bundled:
                     # A non-bundled (user) copy encountered after an already-kept
                     # bundled copy. Bundled always wins — discard the user copy.
+                    # Store as a potential fallback: if the bundled copy later
+                    # fails to load its routes, the server restores this user copy
+                    # so it keeps working. Only the first user copy encountered is
+                    # kept as the fallback (subsequent duplicates are dropped).
+                    if plugin_id not in _pending_evictions:
+                        _pending_evictions[plugin_id] = (plugin_id, plugin_dir, manifest)
                     log.warning(
                         "User-installed copy of bundled plugin %r at %s ignored; "
                         "using bundled version at %s.",
@@ -673,7 +709,7 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                     )
                     continue
                 else:
-                    log.warning("Skipping duplicate plugin %r from %s", plugin_id, plugins_base_dir)
+                    log.warning("Skipping duplicate plugin %r at %s", plugin_id, plugin_dir)
                     continue
             loaded_ids.add(plugin_id)
             plugin_load_specs.append((plugin_id, plugin_dir, manifest))
@@ -696,6 +732,15 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
     # plugins are loaded, so concurrent readers never see a partially
     # populated LOADED_PLUGINS.
     _loaded_batch: list = []
+    # Track plugin_ids whose routes.setup() raised an exception, so we
+    # can fall back to evicted user copies for those plugin_ids below.
+    _route_failed_ids: set[str] = set()
+    # Track plugin_ids whose bundled setup() timed out while already
+    # running (mid-flight). For those, activating the fallback is unsafe
+    # because the original setup() may still be mutating the router
+    # concurrently — fallback routes would mount on top of partial bundled
+    # routes, producing duplicate or conflicting endpoints.
+    _route_mid_flight_ids: set[str] = set()
 
     for idx, (plugin_id, plugin_dir, manifest) in enumerate(plugin_load_specs):
         _emit_progress(
@@ -763,6 +808,10 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                 loaded=idx,
                 total=len(plugin_load_specs),
             )
+            # Capture the current route count so we can detect whether
+            # setup() registered any handlers before raising. FastAPI has
+            # no route-removal API, so partial registration is permanent.
+            _routes_before = len(getattr(app, "routes", []))
             try:
                 # Escape `.` in plugin_id the same way load_sibling
                 # does. Without it, a plugin id like
@@ -792,6 +841,55 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
                     log.info("Loaded routes for plugin %r", plugin_id)
             except Exception as e:
                 log.exception("Failed to load routes for plugin %r", plugin_id)
+                _route_failed_ids.add(plugin_id)
+                # If this was a mid-flight timeout, mark the plugin so the
+                # fallback block skips it — the original setup() may still be
+                # running and registering routes concurrently; mounting a
+                # fallback on top would produce duplicate/conflicting endpoints.
+                if getattr(e, "setup_mid_flight", False):
+                    _route_mid_flight_ids.add(plugin_id)
+                # Detect partial route registration: if setup() mounted any
+                # handlers before raising, those routes stay permanently (no
+                # FastAPI deregistration API). Warn loudly so maintainers can
+                # identify conflicting endpoints in the server log.
+                _routes_after = len(getattr(app, "routes", []))
+                if _routes_after > _routes_before:
+                    log.warning(
+                        "Plugin %r registered %d route(s) before its setup() raised; "
+                        "these handlers cannot be removed and may conflict with any fallback.",
+                        plugin_id, _routes_after - _routes_before,
+                    )
+                # Compute bare-import modules added during the failed load.
+                # IMPORTANT: Filter strictly to modules whose __file__ lives
+                # inside this plugin's directory — the naive set-diff would
+                # capture every module imported by any concurrent thread
+                # (metadata scan, stdlib lazy imports, etc.) between the
+                # snapshot and the failure, causing the fallback block to
+                # delete unrelated entries from sys.modules.
+                # Purge them NOW (not deferred) so subsequent plugins in the
+                # main loop don't accidentally resolve this plugin's helpers
+                # when they do bare `import helper`.  The fallback block's
+                # per-key pop() is a harmless no-op when the keys are already
+                # absent.
+                if plugin_id in _pending_evictions:
+                    _plugin_dir_prefix = str(plugin_dir) + os.sep
+                    _stale = set()
+                    # Scan ALL cached modules (not only those newly added since
+                    # the snapshot) for any whose __file__ lives inside this
+                    # plugin's directory.  A previous load_plugins() call (test
+                    # reload, dev restart) may have left same-named helpers from
+                    # the bundled copy in sys.modules before this run's
+                    # snapshot was taken; diffing against the snapshot alone
+                    # would miss those and let the fallback copy resolve the
+                    # old bundled code on repeated loads.
+                    for _k, _mod in list(sys.modules.items()):
+                        _mf = getattr(_mod, "__file__", None)
+                        if _mf and str(_mf).startswith(_plugin_dir_prefix):
+                            _stale.add(_k)
+                    _pending_eviction_stale_modules[plugin_id] = _stale
+                    # Purge immediately to prevent module leakage into later plugins.
+                    for _k in _stale:
+                        sys.modules.pop(_k, None)
                 _emit_progress(
                     "plugin-error",
                     f"Failed loading routes for '{plugin_id}'",
@@ -811,7 +909,6 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
             # role; plugin is still loaded and scripts run, it just
             # doesn't show up in role-specific UIs. See slopsmith#36.
             "type": manifest.get("type"),
-            "overrides_bundled": bool(manifest.get("__overrides_bundled")),
             # Uses the same _is_bundled() helper as the duplicate-skip path.
             # See the helper's docstring for the three-part check that prevents
             # user-installed plugins (cloned into plugins/ or carrying a forged
@@ -845,6 +942,224 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
             total=len(plugin_load_specs),
         )
 
+    # If any bundled plugin failed to load its routes AND it evicted a
+    # user-installed copy during discovery, fall back to that user copy so
+    # the server remains functional. A bad bundled release should never
+    # leave the plugin completely broken when a working user copy exists.
+    #
+    # NOTE on partial-registration: if the bundled setup() managed to register
+    # some FastAPI routes before raising, those handlers stay permanently (no
+    # route-removal API). The partial-registration warning above names the
+    # count; the fallback copy's routes then mount alongside them, so duplicate
+    # or conflicting endpoints are possible. This is an accepted limitation;
+    # the primary mitigation is thorough testing of bundled releases.
+    #
+    # NOTE on timeout race: in async mode the bundled setup() runs on the
+    # event-loop thread via route_setup_fn. If it times out (>60 s) while
+    # setup() has ALREADY STARTED executing, `_route_mid_flight_ids` is set
+    # for that plugin and the fallback is skipped — the original setup() may
+    # still be mutating the router concurrently and mounting a second set of
+    # routes on top would produce duplicate/conflicting endpoints. The
+    # mid-flight case is detected by the `setup_mid_flight` attribute on the
+    # TimeoutError re-raised by _route_setup_on_main (server.py).
+    # If the timeout fires BEFORE _do() has started, the _cancelled flag
+    # in _route_setup_on_main prevents the queued callback from executing,
+    # making the fallback safe in that case.
+    for evicted_id, evicted_spec in _pending_evictions.items():
+        if evicted_id not in _route_failed_ids:
+            continue
+        if evicted_id in _route_mid_flight_ids:
+            log.warning(
+                "Skipping fallback for %r: bundled setup() timed out while already "
+                "executing; the router may have partial routes from the bundled copy. "
+                "Restart the server to recover.",
+                evicted_id,
+            )
+            # Remove the broken bundled entry too — its routes are in an
+            # unknown state and it should not appear in /api/plugins.
+            _loaded_batch[:] = [e for e in _loaded_batch if e["id"] != evicted_id]
+            continue
+        _ev_id, ev_dir, ev_manifest = evicted_spec
+        log.warning(
+            "Bundled plugin %r failed to load routes; "
+            "falling back to user-installed copy at %s.",
+            evicted_id, ev_dir,
+        )
+        # Remove the broken bundled entry from the batch, recording its
+        # original position so the fallback is inserted there instead of
+        # being appended at the end (appending would change the order of
+        # plugins in /api/plugins and the frontend playSong wrapper chain).
+        _bundled_orig_idx = next(
+            (i for i, e in enumerate(_loaded_batch) if e["id"] == evicted_id),
+            len(_loaded_batch),
+        )
+        _loaded_batch[:] = [e for e in _loaded_batch if e["id"] != evicted_id]
+        # Ensure the fallback directory is at the FRONT of sys.path so
+        # its modules take priority over any bundled copy still present.
+        # Simply inserting when absent is not enough: on repeated
+        # load_plugins() calls (tests, dev reloads) the user-copy dir may
+        # already be in sys.path but behind the bundled dir from an earlier
+        # run, letting bare imports in the fallback still resolve bundled
+        # files. Always remove-then-reinsert to guarantee front-of-path.
+        ev_dir_str = str(ev_dir)
+        if ev_dir_str in sys.path:
+            sys.path.remove(ev_dir_str)
+        sys.path.insert(0, ev_dir_str)
+        ev_context = dict(context)
+        ev_context["load_sibling"] = (
+            lambda name, _pid=evicted_id, _pdir=ev_dir:
+                _load_plugin_sibling(_pid, _pdir, name)
+        )
+        ev_context["log"] = logging.getLogger(f"slopsmith.plugin.{evicted_id}")
+        # Install the fallback copy's requirements. It was evicted before
+        # the main load loop ran, so _install_requirements was never called
+        # for it. A user copy that depends on extra packages would otherwise
+        # fail with an import error even when those packages can be installed.
+        # Mirror the main load-loop contract: _install_requirements returning
+        # False is *non-fatal* (read-only filesystem, optional dep, etc.) —
+        # we emit a plugin-error and continue loading, exactly as the main
+        # loop does. Treating it as fatal here would break the fallback for
+        # those same tolerated cases and leave the bundled-failure error
+        # unresolved.
+        ev_req_ok = _install_requirements(ev_dir, evicted_id)
+        if not ev_req_ok:
+            _emit_progress(
+                "plugin-error",
+                f"Failed to install requirements for fallback copy of '{evicted_id}'",
+                plugin_id=evicted_id,
+                loaded=len(_loaded_batch),
+                total=len(plugin_load_specs),
+                error="Requirements installation failed for fallback copy; check server logs",
+            )
+        # Purge any sibling modules the failed bundled copy may have loaded.
+        # They are cached under the same namespace as what the fallback would use.
+        # The parent package is `plugin_{safe_id}`, sibling modules are
+        # `plugin_{safe_id}.{name}` (from load_sibling), and the routes module is
+        # `plugin_{safe_id}_routes` (note the underscore). Clearing all three
+        # patterns ensures the fallback gets a clean slate and doesn't accidentally
+        # resolve bundled helper code that is still cached in sys.modules.
+        _safe_eid = _safe_plugin_id_for_module_name(evicted_id)
+        _parent_pkg = f"plugin_{_safe_eid}"
+        # The routes module is registered under exactly `{_parent_pkg}_routes`
+        # (underscore, not dot — it is NOT a sub-package of _parent_pkg).
+        # Using startswith(f"{_parent_pkg}_") would incorrectly match
+        # "plugin_a_5f_b_routes" (routes for plugin "a_b") when evicting
+        # plugin "a", because "plugin_a_5f_b_routes".startswith("plugin_a_")
+        # is True. Match the routes entry exactly instead.
+        _stale_sibling_keys = [
+            k for k in list(sys.modules)
+            if k == _parent_pkg
+            or k.startswith(f"{_parent_pkg}.")
+            or k == f"{_parent_pkg}_routes"
+        ]
+        for _k in _stale_sibling_keys:
+            del sys.modules[_k]
+        # Also purge bare-import modules the failed bundled copy may have added
+        # to sys.modules. These are NOT covered by the namespaced purge above;
+        # a bundled plugin that does `import helper` (bare import via sys.path)
+        # would otherwise leave a stale `helper` module in sys.modules that
+        # the fallback copy could accidentally resolve instead of its own file.
+        for _k in _pending_eviction_stale_modules.get(evicted_id, set()):
+            sys.modules.pop(_k, None)
+        # Re-load the fallback's routes using the same module-name slot so
+        # it naturally replaces the previously-failed bundled module.
+        ev_routes_file = ev_manifest.get("routes")
+        # If the user copy has no routes file it cannot restore the bundled
+        # plugin's backend endpoints (the route failure is the very reason we
+        # are in this fallback path). Treat that as a failed recovery so the
+        # bundled-failure error is NOT cleared from startup-status.
+        fallback_routes_ok = bool(ev_routes_file)
+        if ev_routes_file:
+            # Capture route count before fallback setup() to detect partial
+            # registration — same permanent-mount limitation as the main loop.
+            _fallback_routes_before = len(getattr(app, "routes", []))
+            try:
+                ev_module_name = f"plugin_{_safe_plugin_id_for_module_name(evicted_id)}_routes"
+                ev_spec = importlib.util.spec_from_file_location(
+                    ev_module_name, str(ev_dir / ev_routes_file))
+                ev_routes_module = importlib.util.module_from_spec(ev_spec)
+                sys.modules[ev_module_name] = ev_routes_module
+                ev_spec.loader.exec_module(ev_routes_module)
+                if hasattr(ev_routes_module, "setup"):
+                    if route_setup_fn is not None:
+                        _fn = lambda rm=ev_routes_module, ctx=ev_context, a=app: rm.setup(a, ctx)
+                        _fn._plugin_id = evicted_id
+                        route_setup_fn(_fn)
+                    else:
+                        ev_routes_module.setup(app, ev_context)
+                log.info("Loaded routes for fallback copy of plugin %r", evicted_id)
+            except Exception:
+                log.exception(
+                    "Fallback user-installed copy of %r also failed to load routes; "
+                    "plugin unavailable (not registered).", evicted_id,
+                )
+                # Emit a plugin-error so startup-status reflects the
+                # fallback's failure as the root cause, not the earlier
+                # bundled-copy error. Without this the status stays on the
+                # stale bundled error even though that's no longer the
+                # active failure.
+                _emit_progress(
+                    "plugin-error",
+                    f"Fallback copy of plugin '{evicted_id}' also failed to load routes",
+                    plugin_id=evicted_id,
+                    loaded=len(_loaded_batch),
+                    total=len(plugin_load_specs),
+                    error=(
+                        f"Both bundled and user-installed copies of '{evicted_id}' "
+                        "failed to load routes; plugin unavailable — check server logs"
+                    ),
+                )
+                # Warn on partial registration in the fallback path too.
+                _fallback_routes_after = len(getattr(app, "routes", []))
+                if _fallback_routes_after > _fallback_routes_before:
+                    log.warning(
+                        "Fallback copy of %r registered %d route(s) before its setup() raised; "
+                        "these handlers cannot be removed.",
+                        evicted_id, _fallback_routes_after - _fallback_routes_before,
+                    )
+                fallback_routes_ok = False
+        if fallback_routes_ok:
+            _loaded_batch.insert(_bundled_orig_idx, {
+                "id": evicted_id,
+                "name": ev_manifest.get("name", evicted_id),
+                "nav": ev_manifest.get("nav"),
+                "type": ev_manifest.get("type"),
+                "bundled": False,  # user copy, not bundled
+                # Marks this entry as an emergency user-copy fallback: the
+                # bundled routes failed, so the evicted user-installed copy
+                # was loaded instead.  Surfaced in /api/plugins and the
+                # settings UI so users know the bundled build is broken.
+                "fallback": True,
+                "has_screen": bool(ev_manifest.get("screen")),
+                "has_script": bool(ev_manifest.get("script")),
+                "has_settings": bool(ev_manifest.get("settings")),
+                "has_tour": _is_valid_tour_manifest(ev_manifest.get("tour")),
+                "_export_paths": _normalize_export_paths(ev_manifest.get("settings"), evicted_id),
+                "_diagnostics_paths": _normalize_diagnostics_paths(ev_manifest.get("diagnostics"), evicted_id),
+                "_diagnostics_callable_spec": _parse_diagnostics_callable(ev_manifest.get("diagnostics"), evicted_id),
+                "_load_sibling": ev_context["load_sibling"],
+                "_dir": ev_dir,
+                "_manifest": ev_manifest,
+            })
+            log.info("Registered fallback user copy of plugin %r (%s)", evicted_id, ev_manifest.get("name", ""))
+            # Emit a compensating progress event to clear the bundled-failure
+            # error from startup-status. Without this, the final
+            # `plugins-complete` status would still carry the error text from
+            # the bundled failure even though the plugin is now active via the
+            # fallback copy. Uses clear_error=True so the server handler
+            # replaces the stale error with null rather than ignoring it.
+            # Only send clear_error when req install also succeeded; if req
+            # failed we emitted a plugin-error above and must not clear it —
+            # the fallback copy is active but degraded (missing dependencies).
+            _emit_progress(
+                "plugin-registered",
+                f"Registered fallback copy of plugin '{evicted_id}'",
+                plugin_id=evicted_id,
+                loaded=len(_loaded_batch),
+                total=len(plugin_load_specs),
+                clear_error=ev_req_ok,
+            )
+
     # Publish all plugins atomically so concurrent readers never observe
     # a partially-populated list during the loading window.  We clear
     # first so that repeated load_plugins() calls (tests, dev reloads,
@@ -856,8 +1171,8 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
 
     _emit_progress(
         "plugins-complete",
-        f"Loaded {len(plugin_load_specs)} plugin(s)",
-        loaded=len(plugin_load_specs),
+        f"Loaded {len(_loaded_batch)} plugin(s)",
+        loaded=len(_loaded_batch),
         total=len(plugin_load_specs),
     )
 
@@ -923,12 +1238,12 @@ def register_plugin_api(app: FastAPI):
                 # render a "Bundled" badge (lock icon) next to the
                 # plugin name in the settings collapsible.
                 "bundled": p.get("bundled", False),
-                # True when this user-installed copy is shadowing a
-                # bundled copy of the same id. Surfaced via the API so
-                # the plugin-list UI can render an "Overriding bundled
-                # core plugin" badge — visible signal of the active
-                # override matching the warning in the server log.
-                "overrides_bundled": p.get("overrides_bundled", False),
+                # `fallback` is True only for user-installed copies that
+                # are active because the bundled plugin's routes failed.
+                # Surfaced in /api/plugins so the settings UI can show
+                # a warning badge, letting users know the bundled build
+                # is broken and they are running an older user copy.
+                "fallback": p.get("fallback", False),
                 "has_screen": p["has_screen"],
                 "has_script": p["has_script"],
                 "has_settings": p["has_settings"],

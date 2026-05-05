@@ -21,7 +21,9 @@ A 3D note highway visualization for [Slopsmith](https://github.com/byrongamatos/
 
 3D Highway ships **bundled** with Slopsmith — no separate installation needed. Pick **3D Highway** from the visualization picker in the player.
 
-If you want to run a customised fork, place your modified copy in a directory pointed to by the `SLOPSMITH_PLUGINS_DIR` environment variable and restart the server — the loader scans that directory first and prefers your copy over the bundled one.
+> **Note:** The bundled version is preferred over any user-installed copy with the same plugin ID. If you have an old `slopsmith-plugin-3dhighway` clone on disk (from before 3D Highway was promoted to core), it will be ignored at startup — a warning in the server log names the path of the discarded copy. You can safely delete the stale clone.
+>
+> **Fallback:** In the unlikely event that the bundled copy fails to load its routes (e.g., a broken bundled release), Slopsmith will automatically fall back to your user-installed copy and show a yellow "Fallback" badge in the Settings panel. Check the server startup log for the root cause in that case.
 
 ## Settings
 

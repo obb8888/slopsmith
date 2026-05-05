@@ -179,17 +179,33 @@ entry explaining why.
       "name": "Broken Plugin",
       "version": "0.1.0",
       "loaded": false,
-      "dir": "broken"
+      "dir": "broken",
+      "path": "/home/user/.config/slopsmith/plugins/broken"
     }
   ]
 }
 ```
 
 `orphans` covers plugin directories that contain a `plugin.json` but are
-NOT in `LOADED_PLUGINS` (failed to load — usually requirements install
-failure or manifest error). A plugin appearing only in `orphans` is the
-single best diagnostic signal for "user installed plugin X but it's not
-working".
+NOT in `LOADED_PLUGINS`. Two sub-cases:
+
+- **Failed-to-load** (no `evicted` field): the plugin id is not loaded at
+  all — usually requirements install failure or manifest error. A plugin
+  appearing only in `orphans` without `evicted` is the single best
+  diagnostic signal for "user installed plugin X but it's not working".
+- **Evicted/superseded** (`"evicted": true`): the plugin id IS loaded, but
+  from a *different* directory. Typical cause: bundled-wins logic discarded
+  an old user-installed clone in favour of the in-tree copy. Also covers
+  bundled plugin directories whose routes failed and whose server fell back
+  to a user copy (the bundled dir then has a different path from the loaded
+  entry). Check the server startup log for the specific failure reason.
+
+`dir` is the bare directory name. `path` is the full resolved absolute path
+to the orphan directory — the key disambiguator when the bundled copy and a
+user-installed copy share the same directory name (e.g. both `highway_3d`).
+In a redacted bundle `path` has home-dir and config-dir prefixes replaced
+with placeholder tokens (e.g. `<HOME>/...`, `<CONFIG_DIR>/...`) so
+filesystem paths and usernames do not leak.
 
 ### `logs.server.v1` — `logs/server.log.meta.json`
 

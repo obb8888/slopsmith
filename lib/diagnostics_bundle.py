@@ -386,7 +386,7 @@ def _sanitize_remote_url(url: str) -> str:
     return sanitized
 
 
-def _system_plugins(loaded_plugins: list[dict], plugins_root: "Path | list[Path] | None" = None) -> dict:
+def _system_plugins(loaded_plugins: list[dict], plugins_root: "Path | list[Path] | None" = None, redactor=None) -> dict:
     """Build `system.plugins.v1`. Captures every loaded plugin with
     git/manifest info, AND every directory under each plugins root that
     contains a `plugin.json` so orphan / failed-to-load plugins still
@@ -395,8 +395,25 @@ def _system_plugins(loaded_plugins: list[dict], plugins_root: "Path | list[Path]
     *plugins_root* accepts a single Path, a list of Paths (to cover both
     the built-in ``plugins/`` directory and ``SLOPSMITH_PLUGINS_DIR``), or
     None to skip orphan detection entirely.
+
+    Plugin directories not in ``LOADED_PLUGINS`` appear in ``orphans``.
+    Two sub-cases are distinguished:
+
+    * **Stale/evicted copies**: same plugin id as a loaded plugin but a
+      different on-disk path (e.g. an old user clone of a bundled plugin).
+      These receive ``"evicted": True``. This also covers bundled plugin
+      directories whose routes failed and whose server fell back to a
+      user copy — the bundled dir is then the non-loaded directory and
+      appears here too. Check the server startup log for the specific
+      failure reason in that case.
+    * **Failed-to-load orphans**: directories whose plugin id is not in
+      ``LOADED_PLUGINS`` at all (requirements install failure, manifest
+      error, etc.). These appear without ``"evicted"`` set.
     """
     loaded_ids: set[str] = set()
+    # Map plugin_id → resolved directory path for the loaded copy,
+    # used below to distinguish the canonical dir from stale clones.
+    loaded_dir_by_id: dict[str, Path] = {}
     plugins_out: list[dict] = []
     for p in loaded_plugins:
         manifest = p.get("_manifest") or {}
@@ -423,6 +440,8 @@ def _system_plugins(loaded_plugins: list[dict], plugins_root: "Path | list[Path]
         plugins_out.append(entry)
         if entry["id"]:
             loaded_ids.add(entry["id"])
+            if isinstance(plugin_dir, Path):
+                loaded_dir_by_id[entry["id"]] = plugin_dir.resolve()
 
     # Walk plugin root directories to catch orphans (manifest exists but
     # plugin failed to load — common when requirements.txt installs
@@ -452,7 +471,13 @@ def _system_plugins(loaded_plugins: list[dict], plugins_root: "Path | list[Path]
                     manifest = {}
                 pid = manifest.get("id") or child.name
                 if pid in loaded_ids:
-                    continue
+                    # Skip only if this IS the loaded plugin's directory.
+                    # A different directory with the same id is a stale/evicted
+                    # copy — still report it so the diagnostics bundle surfaces it.
+                    loaded_dir = loaded_dir_by_id.get(pid)
+                    if loaded_dir is not None and loaded_dir == child_key:
+                        continue
+                    # Falls through to report as an evicted orphan.
                 orphan = {
                     "id": pid,
                     "name": manifest.get("name", pid),
@@ -460,7 +485,22 @@ def _system_plugins(loaded_plugins: list[dict], plugins_root: "Path | list[Path]
                     "type": manifest.get("type"),
                     "loaded": False,
                     "dir": child.name,
+                    # Full resolved path for disambiguation: when the bundled
+                    # and user-installed copies share the same directory name
+                    # (e.g. both are named "highway_3d"), `dir` alone is
+                    # ambiguous.  `path` lets maintainers identify which root
+                    # the evicted copy came from without inspecting server logs.
+                    # When redaction is active, the path passes through the
+                    # text redactor so home-dir / config-dir prefixes are
+                    # replaced with their placeholder tokens — preventing
+                    # filesystem paths and usernames from leaking in a
+                    # supposedly redacted bundle.
+                    "path": redactor.redact_text(str(child_key)) if redactor is not None else str(child_key),
                 }
+                # Flag directories that share an id with a loaded plugin
+                # (bundled-wins evicted them) vs. true orphans (failed to load).
+                if pid in loaded_ids:
+                    orphan["evicted"] = True
                 git = _git_info(child)
                 if git is not None:
                     orphan["git"] = git
@@ -965,7 +1005,7 @@ def _assemble_files_and_notes(
         files["system/version.json"] = ver_payload
         env_payload = _safe_json_dumps(_system_env(redactor=redactor)).encode("utf-8")
         files["system/env.json"] = env_payload
-        plugins_data = _system_plugins(loaded_plugins, plugins_root=plugins_root)
+        plugins_data = _system_plugins(loaded_plugins, plugins_root=plugins_root, redactor=redactor)
         files["system/plugins.json"] = _safe_json_dumps(plugins_data).encode("utf-8")
         # Plugin loading is async and takes a few seconds on cold
         # boot. If the bundle was captured during that window, every

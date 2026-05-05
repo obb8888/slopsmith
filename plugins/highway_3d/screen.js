@@ -158,6 +158,7 @@
 
     const DOTS = [3, 5, 7, 9, 12, 15, 17, 19, 21, 24];
     const DDOTS = new Set([12, 24]);
+    const INLAY_LABEL_FRETS = [3, 5, 7, 9, 12, 15, 17, 19, 22, 24]; // 22 not 21: intentional display choice
 
     const FRET_COOLDOWN = 0.5; // seconds a lane fret stays active after last note
 
@@ -1412,6 +1413,12 @@
         // place — without this the layer stays at its built-in opacity
         // until the next palette change rebuilds buildBoard().
         let stringLineGlows = [];
+        // Fret inlay number label sprites (one per INLAY_LABEL_FRETS entry).
+        // Retained so update() can rescale them live when _textSizeMul changes.
+        let _inlayLabels = [];
+        // Cloned SpriteMaterials for the inlay labels — disposed on rebuild and
+        // destroy() to prevent GPU leaks across palette changes or panel reuse.
+        let _inlayMats = [];
         // Scratch Color used by _applyVibrancy() to avoid allocating a
         // fresh THREE.Color each time the user drags a slider.
         // Allocated lazily once Three.js is loaded inside initScene().
@@ -2840,6 +2847,31 @@
                     const d = new T.Mesh(dg, dm); d.position.set(cx, my, 0); fretG.add(d);
                 }
             }
+
+            // Fret inlay number labels — sprites sitting just behind the hit line
+            // (Z = -K) so camera-distance sorting in the transparent pass puts
+            // them before notes at Z = 0, letting notes paint on top.
+            // Materials are cloned from the txtMat cache with depthWrite:false so
+            // the sprites don't write stale depth values that would clip incoming
+            // notes (which arrive from large negative Z). Clones are tracked in
+            // _inlayMats for explicit disposal on rebuild and destroy().
+            // Scale uses (0.5 + textSize) directly — _textSizeMul is stale here
+            // (only refreshed at the top of update()); update() rescales live.
+            for (const m of _inlayMats) m.dispose();
+            _inlayMats = [];
+            _inlayLabels = [];
+            for (const f of INLAY_LABEL_FRETS) {
+                const mat = txtMat(f, '#7abfcc', false, 'fretRow').clone();
+                mat.depthWrite = false;
+                mat.opacity = 0.55;
+                const lbl = new T.Sprite(mat);
+                const scale = 3.8 * (0.5 + textSize);
+                lbl.scale.set(scale * K, scale * K, 1);
+                lbl.position.set(fretMid(f), my, -K);
+                fretG.add(lbl);
+                _inlayLabels.push(lbl);
+                _inlayMats.push(mat);
+            }
         }
 
         /* ── String glow (called each frame) ────────────────────────────── */
@@ -2872,6 +2904,13 @@
             // textSize ∈ [0,1]; _textSizeMul ∈ [0.5, 1.5] with 0.5 ↦ 1.0×
             // so default behaviour matches what the renderer did pre-slider.
             _textSizeMul = 0.5 + textSize;
+            // Rescale inlay labels to track the live text-size slider.
+            // buildBoard() sets an initial scale using (0.5 + textSize) but
+            // _textSizeMul is only authoritative from here onward.
+            for (const lbl of _inlayLabels) {
+                const s = 3.8 * _textSizeMul * K;
+                lbl.scale.set(s, s, 1);
+            }
             pNote.reset(); pSus.reset(); pSusOutline.reset(); pTechArrow.reset(); pTapChevron.reset(); pLbl.reset();
             pBeat.reset(); pSec.reset();
             if (projMeshArr) for (const m of projMeshArr) m.visible = false;
@@ -4045,6 +4084,7 @@
             scene = cam = noteG = beatG = lblG = fretG = null;
             ambLight = dirLight = null;
             mStr = []; mGlow = []; mSus = []; mProj = []; mProjGlow = []; mWhiteOutline = mSusOutline = null; mHitOutline = mMissOutline = null; stringLines = []; stringLineGlows = [];
+            for (const m of _inlayMats) m?.dispose?.(); _inlayMats = []; _inlayLabels = [];
             // mTechArrow / mTapChevron are owned by pooled meshes attached
             // to noteG; the scene.traverse() dispose pass above already
             // frees them once any pool factory has instantiated a mesh.

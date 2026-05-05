@@ -340,6 +340,250 @@ def test_startup_status_plugin_error_event_preserved_in_complete(monkeypatch, st
     assert endpoint_data["error"] == _FAKE_PLUGIN_ERROR_TEXT
 
 
+def test_startup_status_plugin_error_cleared_by_explicit_none_progress(monkeypatch, startup_harness):
+    """When a plugin-registered event carries explicit error=None after a
+    preceding plugin-error event, the stale error must be cleared from
+    startup-status. This exercises the ``'error' in event`` path in _on_progress
+    which was added to support the bundled-plugin fallback (Thread 4,
+    review-4226783807).
+
+    A regression that checks ``event.get("error") is not None`` instead of
+    ``"error" in event`` would leave the stale bundled-failure error in the
+    status even though the user-copy fallback succeeded.
+    """
+    server, phases = startup_harness
+
+    # Simulate the exact sequence load_plugins emits during a successful
+    # bundled-failure fallback: plugin-error (bundled broken) followed by
+    # plugin-registered with explicit error=None (fallback OK, clear error).
+    _FAKE_FALLBACK_RECOVERY_EVENTS = [
+        {"phase": "plugins-discovered", "message": "Discovered 1 plugin(s)",
+         "plugin_id": "", "loaded": 0, "total": 1},
+        {"phase": "plugin-start", "message": "Loading plugin 'myplug'",
+         "plugin_id": "myplug", "loaded": 0, "total": 1},
+        {"phase": "plugin-requirements", "message": "Installing requirements for 'myplug' (if needed)",
+         "plugin_id": "myplug", "loaded": 0, "total": 1},
+        {"phase": "plugin-error", "message": "Failed loading routes for 'myplug'",
+         "plugin_id": "myplug", "loaded": 0, "total": 1, "error": "Failed to load bundled plugin routes"},
+        # Fallback success: event explicitly carries error=None to clear the stale error.
+        {"phase": "plugin-registered", "message": "Registered fallback copy of plugin 'myplug'",
+         "plugin_id": "myplug", "loaded": 1, "total": 1, "error": None},
+        {"phase": "plugins-complete", "message": "Loaded 1 plugin(s)",
+         "plugin_id": "", "loaded": 1, "total": 1},
+    ]
+
+    def fake_load_plugins(_app, _context, progress_cb=None, route_setup_fn=None):
+        if progress_cb:
+            for event in _FAKE_FALLBACK_RECOVERY_EVENTS:
+                progress_cb(event)
+
+    monkeypatch.setattr(server, "load_plugins", fake_load_plugins)
+    asyncio.run(server.startup_events())
+    final = server._get_startup_status()
+
+    # The plugin-error event sets error; the plugin-registered with error=None
+    # must clear it. If _on_progress only forwards non-null errors, this fails.
+    assert final["error"] is None, (
+        f"Expected error to be cleared by explicit error=None event, got {final['error']!r}"
+    )
+    assert final["phase"] == "complete"
+    assert final["running"] is False
+
+    # Verify via the HTTP endpoint too — a disconnect between the endpoint
+    # handler and _get_startup_status would silently pass the assertion above.
+    async def _fetch_endpoint_data():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server.app), base_url="http://test"
+        ) as ac:
+            r = await ac.get("/api/startup-status")
+            return r.json()
+
+    endpoint_data = asyncio.run(_fetch_endpoint_data())
+    assert endpoint_data["phase"] == "complete"
+    assert endpoint_data["running"] is False
+    assert endpoint_data["error"] is None, (
+        f"HTTP endpoint should also show cleared error, got {endpoint_data['error']!r}"
+    )
+
+
+def test_startup_status_clear_error_does_not_erase_unrelated_plugin_failure(
+    monkeypatch, startup_harness
+):
+    """When plugin A fails and then plugin B's fallback recovery emits
+    error=None, the error set by plugin A must NOT be cleared.
+
+    This exercises the _active_errors dict tracking added in server.py
+    (Thread 2, review-4226937699).  Without that guard, a fallback clear
+    from any plugin would erase all startup-status errors regardless of
+    source, hiding a broken plugin from the user.
+    """
+    server, phases = startup_harness
+
+    # plugin_a fails; plugin_b's fallback succeeds and emits error=None.
+    # plugin_a's error must survive because the clear came from plugin_b.
+    _EVENTS = [
+        {"phase": "plugin-error", "message": "Failed for plugin_a",
+         "plugin_id": "plugin_a", "loaded": 0, "total": 2,
+         "error": "plugin_a route failure"},
+        # plugin_b's fallback recovery — clears *its own* error, not plugin_a's.
+        {"phase": "plugin-registered", "message": "Registered fallback of plugin_b",
+         "plugin_id": "plugin_b", "loaded": 1, "total": 2, "error": None},
+        {"phase": "plugins-complete", "message": "Loaded 1 plugin(s)",
+         "plugin_id": "", "loaded": 1, "total": 2},
+    ]
+
+    def fake_load_plugins(_app, _context, progress_cb=None, route_setup_fn=None):
+        if progress_cb:
+            for event in _EVENTS:
+                progress_cb(event)
+
+    monkeypatch.setattr(server, "load_plugins", fake_load_plugins)
+    asyncio.run(server.startup_events())
+    final = server._get_startup_status()
+
+    # plugin_a's error must still be present — plugin_b's clear must not erase it.
+    assert final["error"] == "plugin_a route failure", (
+        f"plugin_a error should be preserved after plugin_b's clear, got {final['error']!r}"
+    )
+
+
+def test_startup_status_two_plugin_errors_one_clears_other_remains(
+    monkeypatch, startup_harness
+):
+    """When two plugins fail and only one recovers via fallback, the other
+    plugin's error must remain visible in startup-status.
+
+    The _last_error single-pointer approach could not handle this case: once
+    plugin B overwrote the pointer, B's subsequent clear_error would wipe
+    the status to None even though A was still broken.  The _active_errors
+    dict correctly removes B and restores A's failure.
+    """
+    server, phases = startup_harness
+
+    _EVENTS = [
+        # Both plugins fail.
+        {"phase": "plugin-error", "message": "Failed for plugin_a",
+         "plugin_id": "plugin_a", "loaded": 0, "total": 2,
+         "error": "plugin_a route failure"},
+        {"phase": "plugin-error", "message": "Failed for plugin_b",
+         "plugin_id": "plugin_b", "loaded": 0, "total": 2,
+         "error": "plugin_b route failure"},
+        # plugin_b's fallback succeeds and clears its own error.
+        {"phase": "plugin-registered", "message": "Registered fallback of plugin_b",
+         "plugin_id": "plugin_b", "loaded": 1, "total": 2, "error": None},
+        {"phase": "plugins-complete", "message": "Loaded 1 plugin(s)",
+         "plugin_id": "", "loaded": 1, "total": 2},
+    ]
+
+    def fake_load_plugins(_app, _context, progress_cb=None, route_setup_fn=None):
+        if progress_cb:
+            for event in _EVENTS:
+                progress_cb(event)
+
+    monkeypatch.setattr(server, "load_plugins", fake_load_plugins)
+    asyncio.run(server.startup_events())
+    final = server._get_startup_status()
+
+    # plugin_a's error must still be present after plugin_b's recovery.
+    assert final["error"] == "plugin_a route failure", (
+        f"plugin_a error should remain after plugin_b recovery, got {final['error']!r}"
+    )
+
+
+def test_startup_status_latest_error_wins_when_same_plugin_emits_multiple(
+    monkeypatch, startup_harness
+):
+    """When the same plugin emits multiple error events (e.g. requirements
+    failure then routes failure), restoring after another plugin clears must
+    surface the *latest* error from the first plugin, not the first one.
+
+    The dict.update()-in-place approach fails here because assigning a key
+    that already exists does NOT move it to the end of insertion order.
+    The fix (pop + re-insert) guarantees remaining[-1] is always the most
+    recently emitted unresolved failure.
+    (Thread 3, review-4228077246)
+    """
+    server, phases = startup_harness
+
+    _EVENTS = [
+        # plugin_a emits two successive errors.
+        {"phase": "plugin-error", "message": "req failure",
+         "plugin_id": "plugin_a", "loaded": 0, "total": 2,
+         "error": "plugin_a requirements failure"},
+        {"phase": "plugin-error", "message": "routes failure",
+         "plugin_id": "plugin_a", "loaded": 0, "total": 2,
+         "error": "plugin_a routes failure"},
+        # plugin_b fails, then recovers — clears only its own error.
+        {"phase": "plugin-error", "message": "Failed for plugin_b",
+         "plugin_id": "plugin_b", "loaded": 1, "total": 2,
+         "error": "plugin_b route failure"},
+        {"phase": "plugin-registered", "message": "Registered fallback of plugin_b",
+         "plugin_id": "plugin_b", "loaded": 2, "total": 2, "error": None},
+        {"phase": "plugins-complete", "message": "Loaded 1 plugin(s)",
+         "plugin_id": "", "loaded": 1, "total": 2},
+    ]
+
+    def fake_load_plugins(_app, _context, progress_cb=None, route_setup_fn=None):
+        if progress_cb:
+            for event in _EVENTS:
+                progress_cb(event)
+
+    monkeypatch.setattr(server, "load_plugins", fake_load_plugins)
+    asyncio.run(server.startup_events())
+    final = server._get_startup_status()
+
+    # After plugin_b clears its own error, plugin_a's *latest* error (routes
+    # failure) should be surfaced — not the earlier requirements failure.
+    assert final["error"] == "plugin_a routes failure", (
+        f"Expected latest plugin_a error after plugin_b recovery, got {final['error']!r}"
+    )
+
+
+def test_startup_status_fallback_req_error_not_cleared_by_route_success(
+    monkeypatch, startup_harness
+):
+    """When a fallback copy's requirements installation fails (non-fatal) but its
+    routes succeed, the plugin-registered event must NOT carry error=None — that
+    would wipe the req-failure from _active_errors and make startup look clean
+    even though the active fallback copy has missing dependencies.
+    (Thread 1, review-4228421486)
+    """
+    server, phases = startup_harness
+
+    _EVENTS = [
+        # Bundled plugin fails its routes.
+        {"phase": "plugin-error", "message": "Bundled routes failed",
+         "plugin_id": "highway_3d", "loaded": 0, "total": 1,
+         "error": "bundled routes failure"},
+        # Fallback req install also fails (non-fatal).
+        {"phase": "plugin-error", "message": "Fallback req failed",
+         "plugin_id": "highway_3d", "loaded": 0, "total": 1,
+         "error": "fallback req failure"},
+        # Fallback routes succeed — plugin-registered WITHOUT clear_error
+        # because req failed.  event must NOT carry "error" key.
+        {"phase": "plugin-registered", "message": "Registered fallback",
+         "plugin_id": "highway_3d", "loaded": 1, "total": 1},
+        {"phase": "plugins-complete", "message": "Loaded 1 plugin(s)",
+         "plugin_id": "", "loaded": 1, "total": 1},
+    ]
+
+    def fake_load_plugins(_app, _context, progress_cb=None, route_setup_fn=None):
+        if progress_cb:
+            for event in _EVENTS:
+                progress_cb(event)
+
+    monkeypatch.setattr(server, "load_plugins", fake_load_plugins)
+    asyncio.run(server.startup_events())
+    final = server._get_startup_status()
+
+    # Startup must still report the req-failure error — the fallback succeeded
+    # in loading routes but its dependencies are degraded.
+    assert final["error"] == "fallback req failure", (
+        f"Expected req-failure error to persist after fallback route success, "
+        f"got {final['error']!r}"
+    )
+
+
 def test_startup_status_e2e_real_plugin_loader(tmp_path, monkeypatch, isolate_logging):
     """Integration: run startup_events() with the REAL load_plugins against a
     minimal test plugin, using the production background-thread code path.
