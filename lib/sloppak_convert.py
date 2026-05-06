@@ -341,6 +341,41 @@ def _run_demucs(full_ogg: Path, out_dir: Path, model: str) -> Path:
     cache_root.mkdir(parents=True, exist_ok=True)
     env.setdefault("TORCH_HOME", str(cache_root))
     env.setdefault("XDG_CACHE_HOME", str(cache_root))
+    # Pin demucs to the bundled ffmpeg/ffprobe. demucs.audio probes the
+    # child's PATH for both binaries (ffprobe first, for stream metadata)
+    # and falls back to torchcodec when missing; the desktop bundle's
+    # torchcodec native shims can't load against the vgmstream-patched
+    # FFmpeg DLLs we ship, so the fallback path is broken — we have to
+    # keep demucs on the ffmpeg/ffprobe path. Resolves to resources/bin/
+    # in desktop builds (lib/sloppak_convert.py → resources/slopsmith/lib
+    # → resources/bin). Gate on vgmstream-cli's presence so we don't
+    # accidentally prepend a system /bin/ (Docker's `/app/lib/...`
+    # resolves parents[2] to `/`, and `/bin/ffprobe` exists there too) —
+    # vgmstream-cli is bundled on every desktop platform and isn't a
+    # typical system binary, so it's a precise signature for the
+    # desktop layout.
+    _bundled_bin = Path(__file__).resolve().parents[2] / "bin"
+    if any((_bundled_bin / name).is_file() for name in ("vgmstream-cli", "vgmstream-cli.exe")):
+        # On Windows the env var is conventionally `Path`, not `PATH`;
+        # os.environ is case-insensitive but os.environ.copy() returns a
+        # plain dict that preserves whatever casing the OS used. If we
+        # blindly write to env["PATH"], Windows ends up with both `Path`
+        # and `PATH` keys in the spawned subprocess's env block — and
+        # which one wins is implementation-defined. Reuse the existing
+        # key's casing (or fall through to "PATH" on Linux/macOS).
+        _path_key = next(
+            (k for k in env if k.upper() == "PATH"),
+            "PATH",
+        )
+        # Avoid producing a trailing separator when the parent PATH is
+        # empty/missing — on some platforms a trailing pathsep implicitly
+        # injects the current directory into the search path.
+        _existing_path = env.get(_path_key, "")
+        env[_path_key] = (
+            str(_bundled_bin) + os.pathsep + _existing_path
+            if _existing_path
+            else str(_bundled_bin)
+        )
     # Propagate in-process sys.path additions (plugin loader adds
     # /config/pip_packages at runtime, not via PYTHONPATH) so the child
     # python can also find demucs/torch/torchcodec. PYTHONPATH alone
@@ -366,9 +401,13 @@ def _run_demucs(full_ogg: Path, out_dir: Path, model: str) -> Path:
            "-n", model, "-o", str(out_dir), str(full_ogg)]
     r = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if r.returncode != 0:
-        err_tail = (r.stderr or "").strip().splitlines()[-5:]
+        # demucs writes loader errors to stdout, not stderr -- include both
+        # so the surfaced RuntimeError actually points at the cause.
+        out_tail = (r.stdout or "").strip().splitlines()[-8:]
+        err_tail = (r.stderr or "").strip().splitlines()[-8:]
+        tail = " | ".join(out_tail + err_tail) or "(no output)"
         raise RuntimeError(
-            f"demucs exited with code {r.returncode}: " + " | ".join(err_tail)
+            f"demucs exited with code {r.returncode}: " + tail
         )
     track_stem = full_ogg.stem
     result_dir = out_dir / model / track_stem

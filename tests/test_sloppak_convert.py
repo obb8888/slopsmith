@@ -1,10 +1,14 @@
-"""Tests for lib/sloppak_convert.py pure helpers (sanitize_stem, _arrangement_id).
-
-Both are regex-based string helpers with zero fixture cost. See issue #45.
+"""Tests for lib/sloppak_convert.py pure helpers (sanitize_stem, _arrangement_id)
+and the demucs subprocess wiring (_run_demucs PATH-pinning + error capture).
 """
+
+import os
+import subprocess
+from types import SimpleNamespace
 
 import pytest
 
+import sloppak_convert
 from sloppak_convert import sanitize_stem, _arrangement_id
 
 
@@ -80,3 +84,236 @@ def test_arrangement_id_mutates_the_used_set_in_place():
     _arrangement_id("Rhythm", used)
     _arrangement_id("Rhythm", used)
     assert used == {"rhythm", "rhythm2", "rhythm3"}
+
+
+# ── _run_demucs PATH pinning + error capture ────────────────────────────────
+# On Windows desktop builds, demucs's audio loader spawns ffprobe before
+# ffmpeg. The bundled binaries live in resources/bin/, two parents up from
+# this lib/ file. We pin them onto the child's PATH so demucs always finds
+# them, and we fold stdout into RuntimeError messages because demucs writes
+# its loader errors to stdout.
+
+def _stub_subprocess_run(captured: dict, *, returncode=0, stdout="", stderr=""):
+    def fake_run(cmd, env=None, capture_output=False, text=False, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = env
+        captured["capture_output"] = capture_output
+        captured["text"] = text
+        # Guard against regressions: _run_demucs must capture both streams in
+        # text mode, otherwise the RuntimeError tails come back as bytes or
+        # are dropped entirely (re-introducing the empty-error-output bug
+        # this PR fixes).
+        assert capture_output, "_run_demucs must call subprocess.run with capture_output=True"
+        assert text, "_run_demucs must call subprocess.run with text=True"
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+    return fake_run
+
+
+def test_run_demucs_prepends_bundled_bin_to_path(tmp_path, monkeypatch):
+    """When the desktop bundle layout is detected, _run_demucs prepends
+    resources/bin/ to the child env's PATH. The detection signature is
+    a vgmstream-cli marker file inside the candidate bin dir."""
+    fake_resources = tmp_path / "resources"
+    fake_lib = fake_resources / "slopsmith" / "lib"
+    fake_lib.mkdir(parents=True)
+    fake_bin = fake_resources / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "vgmstream-cli").write_text("")  # desktop-bundle marker
+
+    monkeypatch.setattr(sloppak_convert, "__file__", str(fake_lib / "sloppak_convert.py"))
+    monkeypatch.setenv("PATH", "/preexisting/path")
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path / "cfg"))
+
+    captured: dict = {}
+    monkeypatch.setattr(subprocess, "run", _stub_subprocess_run(captured))
+
+    out_dir = tmp_path / "out"
+    full_ogg = tmp_path / "song.ogg"
+    full_ogg.write_bytes(b"")
+    # _run_demucs raises afterwards because the result dir doesn't exist
+    # under the stub — we only care about the env that was passed to run.
+    with pytest.raises(RuntimeError):
+        sloppak_convert._run_demucs(full_ogg, out_dir, model="htdemucs_6s")
+
+    env = captured["env"]
+    assert env is not None
+    path_parts = env["PATH"].split(os.pathsep)
+    assert path_parts[0] == str(fake_bin)
+    assert "/preexisting/path" in path_parts
+
+
+def test_run_demucs_prepends_bundled_bin_does_not_introduce_empty_pathsep(tmp_path, monkeypatch):
+    """When the parent PATH is empty/missing, the prepend must not produce
+    a trailing pathsep — that implicitly injects the current directory
+    into the search path on some platforms."""
+    fake_resources = tmp_path / "resources"
+    fake_lib = fake_resources / "slopsmith" / "lib"
+    fake_lib.mkdir(parents=True)
+    fake_bin = fake_resources / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "vgmstream-cli").write_text("")
+
+    monkeypatch.setattr(sloppak_convert, "__file__", str(fake_lib / "sloppak_convert.py"))
+    monkeypatch.delenv("PATH", raising=False)
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path / "cfg"))
+
+    captured: dict = {}
+    monkeypatch.setattr(subprocess, "run", _stub_subprocess_run(captured))
+
+    full_ogg = tmp_path / "song.ogg"
+    full_ogg.write_bytes(b"")
+    with pytest.raises(RuntimeError):
+        sloppak_convert._run_demucs(full_ogg, tmp_path / "out", model="htdemucs_6s")
+
+    assert captured["env"]["PATH"] == str(fake_bin)
+    assert not captured["env"]["PATH"].endswith(os.pathsep)
+
+
+def test_run_demucs_preserves_windows_path_var_casing(tmp_path, monkeypatch):
+    """On Windows os.environ.copy() returns a dict containing `Path`
+    (the OS's native casing) rather than `PATH`. Blindly writing
+    `env["PATH"] = ...` leaves the original `Path` key untouched and
+    spawns a subprocess with both keys in its env block — Windows
+    resolution is then implementation-defined. The implementation must
+    reuse whatever PATH-equivalent key was already there."""
+    fake_resources = tmp_path / "resources"
+    fake_lib = fake_resources / "slopsmith" / "lib"
+    fake_lib.mkdir(parents=True)
+    fake_bin = fake_resources / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "vgmstream-cli.exe").write_text("")
+
+    monkeypatch.setattr(sloppak_convert, "__file__", str(fake_lib / "sloppak_convert.py"))
+    # Remove every existing PATH-equivalent and seed only `Path` (Windows shape).
+    for key in [k for k in os.environ if k.upper() == "PATH"]:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("Path", "C:\\Windows\\system32;C:\\Windows")
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path / "cfg"))
+
+    captured: dict = {}
+    monkeypatch.setattr(subprocess, "run", _stub_subprocess_run(captured))
+
+    full_ogg = tmp_path / "song.ogg"
+    full_ogg.write_bytes(b"")
+    with pytest.raises(RuntimeError):
+        sloppak_convert._run_demucs(full_ogg, tmp_path / "out", model="htdemucs_6s")
+
+    env = captured["env"]
+    # Exactly one PATH-equivalent key must exist, and it must reuse the
+    # original `Path` casing rather than introduce a sibling `PATH`.
+    path_keys = [k for k in env if k.upper() == "PATH"]
+    assert path_keys == ["Path"], f"expected only 'Path', got {path_keys!r}"
+    assert env["Path"].split(os.pathsep)[0] == str(fake_bin)
+    assert "C:\\Windows\\system32" in env["Path"]
+
+
+def test_run_demucs_prepends_bundled_bin_with_windows_marker(tmp_path, monkeypatch):
+    """vgmstream-cli.exe (Windows desktop bundle) also satisfies the marker check."""
+    fake_resources = tmp_path / "resources"
+    fake_lib = fake_resources / "slopsmith" / "lib"
+    fake_lib.mkdir(parents=True)
+    fake_bin = fake_resources / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "vgmstream-cli.exe").write_text("")
+
+    monkeypatch.setattr(sloppak_convert, "__file__", str(fake_lib / "sloppak_convert.py"))
+    monkeypatch.setenv("PATH", "/preexisting/path")
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path / "cfg"))
+
+    captured: dict = {}
+    monkeypatch.setattr(subprocess, "run", _stub_subprocess_run(captured))
+
+    full_ogg = tmp_path / "song.ogg"
+    full_ogg.write_bytes(b"")
+    with pytest.raises(RuntimeError):
+        sloppak_convert._run_demucs(full_ogg, tmp_path / "out", model="htdemucs_6s")
+
+    assert captured["env"]["PATH"].split(os.pathsep)[0] == str(fake_bin)
+
+
+def test_run_demucs_no_op_when_bundled_bin_missing(tmp_path, monkeypatch):
+    """No resources/bin/ → PATH is left untouched (dev / non-desktop case)."""
+    fake_lib = tmp_path / "no-bundle" / "lib"
+    fake_lib.mkdir(parents=True)
+    monkeypatch.setattr(sloppak_convert, "__file__", str(fake_lib / "sloppak_convert.py"))
+    monkeypatch.setenv("PATH", "/preexisting/path")
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path / "cfg"))
+
+    captured: dict = {}
+    monkeypatch.setattr(subprocess, "run", _stub_subprocess_run(captured))
+
+    full_ogg = tmp_path / "song.ogg"
+    full_ogg.write_bytes(b"")
+    with pytest.raises(RuntimeError):
+        sloppak_convert._run_demucs(full_ogg, tmp_path / "out", model="htdemucs_6s")
+
+    assert captured["env"]["PATH"] == "/preexisting/path"
+
+
+def test_run_demucs_no_op_when_bin_lacks_desktop_marker(tmp_path, monkeypatch):
+    """Docker case: parents[2] resolves to /, /bin exists with system
+    binaries, but vgmstream-cli is absent — must not prepend."""
+    fake_resources = tmp_path / "resources"
+    fake_lib = fake_resources / "slopsmith" / "lib"
+    fake_lib.mkdir(parents=True)
+    fake_bin = fake_resources / "bin"
+    fake_bin.mkdir()
+    # Simulate /bin: ffmpeg/ffprobe present, vgmstream-cli absent.
+    (fake_bin / "ffmpeg").write_text("")
+    (fake_bin / "ffprobe").write_text("")
+
+    monkeypatch.setattr(sloppak_convert, "__file__", str(fake_lib / "sloppak_convert.py"))
+    monkeypatch.setenv("PATH", "/preexisting/path")
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path / "cfg"))
+
+    captured: dict = {}
+    monkeypatch.setattr(subprocess, "run", _stub_subprocess_run(captured))
+
+    full_ogg = tmp_path / "song.ogg"
+    full_ogg.write_bytes(b"")
+    with pytest.raises(RuntimeError):
+        sloppak_convert._run_demucs(full_ogg, tmp_path / "out", model="htdemucs_6s")
+
+    assert captured["env"]["PATH"] == "/preexisting/path"
+
+
+def test_run_demucs_failure_includes_stdout_in_error(tmp_path, monkeypatch):
+    """demucs prints loader errors to stdout — they must reach the RuntimeError."""
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path / "cfg"))
+    captured: dict = {}
+    monkeypatch.setattr(
+        subprocess, "run",
+        _stub_subprocess_run(
+            captured,
+            returncode=1,
+            stdout="Could not load file song.ogg.\nFFmpeg is not installed.",
+            stderr="",
+        ),
+    )
+
+    full_ogg = tmp_path / "song.ogg"
+    full_ogg.write_bytes(b"")
+    with pytest.raises(RuntimeError) as excinfo:
+        sloppak_convert._run_demucs(full_ogg, tmp_path / "out", model="htdemucs_6s")
+
+    msg = str(excinfo.value)
+    assert "code 1" in msg
+    assert "FFmpeg is not installed" in msg
+    assert "Could not load file" in msg
+
+
+def test_run_demucs_failure_with_no_output_yields_sentinel(tmp_path, monkeypatch):
+    """Empty stdout+stderr should still produce a meaningful error tail."""
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path / "cfg"))
+    captured: dict = {}
+    monkeypatch.setattr(
+        subprocess, "run",
+        _stub_subprocess_run(captured, returncode=1, stdout="", stderr=""),
+    )
+
+    full_ogg = tmp_path / "song.ogg"
+    full_ogg.write_bytes(b"")
+    with pytest.raises(RuntimeError) as excinfo:
+        sloppak_convert._run_demucs(full_ogg, tmp_path / "out", model="htdemucs_6s")
+
+    assert "(no output)" in str(excinfo.value)
