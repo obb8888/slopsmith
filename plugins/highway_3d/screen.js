@@ -396,7 +396,7 @@
         return _bgBandsCache;
     }
 
-    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramSize: 0.5, chordDiagramPosition: 'tl', fretColumnMarkerCadence: 4 };
+    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramSize: 0.5, chordDiagramPosition: 'tl', fretColumnMarkerCadence: 4, inlayLabelsVisible: true };
     const BG_STYLE_IDS = ['off', 'particles', 'silhouettes', 'lights', 'geometric', 'image', 'video'];
 
     function _bgPanelKey(canvas) {
@@ -434,7 +434,7 @@
     // means (fall back to default rather than silently flipping to
     // false). Add new boolean keys to BG_DEFAULTS and they pick this
     // up via the dispatch below.
-    const _BG_BOOL_KEYS = new Set(['reactive', 'showFretOnNote', 'cameraLockLow']);
+    const _BG_BOOL_KEYS = new Set(['reactive', 'showFretOnNote', 'cameraLockLow', 'inlayLabelsVisible']);
     function _bgCoerceBool(val, fallback) {
         if (val === 'true' || val === '1') return true;
         if (val === 'false' || val === '0') return false;
@@ -520,6 +520,7 @@
     window.h3dBgSetChordDiagramSize     = (v) => _bgWriteGlobal('chordDiagramSize', v);
     window.h3dBgSetChordDiagramPosition = (v) => _bgWriteGlobal('chordDiagramPosition', v);
     window.h3dBgSetFretColumnMarkerCadence = (v) => _bgWriteGlobal('fretColumnMarkerCadence', v);
+    window.h3dBgSetInlayLabelsVisible = (v) => _bgWriteGlobal('inlayLabelsVisible', !!v);
     // Custom image asset for the 'image' bg style (#19). Composite setter:
     // writes both the data URL (the bytes that drive the texture) and the
     // display filename, each emitting a change event. The listener
@@ -1397,6 +1398,7 @@
         let chordDiagramSize     = BG_DEFAULTS.chordDiagramSize;
         let chordDiagramPosition = BG_DEFAULTS.chordDiagramPosition;
         let fretColumnMarkerCadence = BG_DEFAULTS.fretColumnMarkerCadence;
+        let inlayLabelsVisible = BG_DEFAULTS.inlayLabelsVisible;
         let _vibrancyIdleOp = 0.4  + 0.6  * BG_DEFAULTS.vibrancy;
         let _vibrancyProjOp = 0.15 + 0.35 * BG_DEFAULTS.vibrancy;
         // Custom image asset (issue #19). Data URL is the bytes that
@@ -2383,6 +2385,10 @@
             // slider.
             _applyVibrancy();
             _applyGlow();
+            // buildBoard() ran above with the default inlayLabelsVisible,
+            // before _bgLoadSettings populated the user-stored value.
+            // Sync now so first-frame state matches the stored setting.
+            for (const lbl of _inlayLabels) lbl.visible = inlayLabelsVisible;
             bgGroup = new T.Group();
             // Note: renderOrder on a Group is a no-op (Three.js Groups
             // are transforms, not rendered objects, so renderOrder only
@@ -2394,6 +2400,14 @@
             scene.add(bgGroup);
             _bgMountStyle();
             _bgListener = (changedKey) => {
+                if (changedKey === 'inlayLabelsVisible') {
+                    _bgLoadSettings();
+                    // Flip visibility on the already-built sprites; no
+                    // need to rebuild the board (cheaper, preserves the
+                    // shared materials and avoids palette re-apply churn).
+                    for (const lbl of _inlayLabels) lbl.visible = inlayLabelsVisible;
+                    return;
+                }
                 if (changedKey === 'reactive' || changedKey === 'showFretOnNote' ||
                     changedKey === 'cameraSmoothing' || changedKey === 'zoomSmoothing' ||
                     changedKey === 'tiltSmoothing' || changedKey === 'cameraLockLow' ||
@@ -2593,6 +2607,7 @@
             chordDiagramSize     = _bgReadSetting(panelKey, 'chordDiagramSize');
             chordDiagramPosition = _bgReadSetting(panelKey, 'chordDiagramPosition');
             fretColumnMarkerCadence = _bgReadSetting(panelKey, 'fretColumnMarkerCadence');
+            inlayLabelsVisible = _bgReadSetting(panelKey, 'inlayLabelsVisible');
             _vibrancyIdleOp = 0.4  + 0.6  * vibrancy;
             _vibrancyProjOp = 0.15 + 0.35 * vibrancy;
             // Custom image asset is a single GLOBAL slot — bytes are
@@ -2937,6 +2952,7 @@
                 const scale = 5.5 * (0.5 + textSize);
                 lbl.scale.set(scale * K, scale * K, 1);
                 lbl.position.set(fretMid(f), yTop - S_GAP * 0.4, -K);
+                lbl.visible = inlayLabelsVisible;
                 fretG.add(lbl);
                 _inlayLabels.push(lbl);
                 _inlayMats.push(mat);

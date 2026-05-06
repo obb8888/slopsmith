@@ -384,6 +384,25 @@
         </p>
     </div>
 
+    <!-- Static inlay fret-number labels on the fretboard.
+         UI is inverted-polarity for clarity: checking the box hides
+         the labels. Storage stays `inlayLabelsVisible` (true=visible)
+         so the renderer reads the natural-direction flag. -->
+    <div class="mt-4">
+        <label class="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
+            <input type="checkbox" id="h3d-inlay-labels-visible"
+                   onchange="window.h3dBgSetInlayLabelsVisible && window.h3dBgSetInlayLabelsVisible(!this.checked)"
+                   class="accent-accent">
+            Hide static fret-inlay number labels
+        </label>
+        <p class="text-[10px] text-gray-500 mt-1 ml-6">
+            Teal numbers (3, 5, 7, 9, 12, 15, 17, 19, 22, 24) painted
+            between the strings on the fretboard at the standard inlay
+            positions. When visible, they stay fixed (don't scroll).
+            Independent of the rolling fret-column markers above.
+        </p>
+    </div>
+
     <!-- Hydrate from localStorage on load. Mirror runtime defaults AND
          coercion rules from screen.js's BG_DEFAULTS / _bgCoerce so first-
          run users see what the renderer actually drew, and any garbage
@@ -392,7 +411,7 @@
          no-selection / NaN state. -->
     <script>
         (function () {
-            const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramSize: 0.5, chordDiagramPosition: 'tl', fretColumnMarkerCadence: 4 };
+            const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramSize: 0.5, chordDiagramPosition: 'tl', fretColumnMarkerCadence: 4, inlayLabelsVisible: true };
             const VALID_STYLES = new Set(['off', 'particles', 'silhouettes', 'lights', 'geometric', 'image', 'video']);
             const VALID_PALETTES = new Set(['default', 'neon', 'pastel']);
             const VALID_CHORD_DIAG_POSITIONS = new Set(['tl', 'tr', 'bl', 'br']);
@@ -489,6 +508,7 @@
             let storedChordDiagramSize = null;
             let storedChordDiagramPosition = null;
             let storedFretColumnMarkerCadence = null;
+            let storedInlayLabelsVisible = null;
             try {
                 storedStyle = localStorage.getItem('h3d_bg_style');
                 storedI = localStorage.getItem('h3d_bg_intensity');
@@ -506,6 +526,7 @@
                 storedChordDiagramSize = localStorage.getItem('h3d_bg_chordDiagramSize');
                 storedChordDiagramPosition = localStorage.getItem('h3d_bg_chordDiagramPosition');
                 storedFretColumnMarkerCadence = localStorage.getItem('h3d_bg_fretColumnMarkerCadence');
+                storedInlayLabelsVisible = localStorage.getItem('h3d_bg_inlayLabelsVisible');
                 storedCustomImageDataUrl = localStorage.getItem('h3d_bg_customImageDataUrl');
                 storedCustomImageName = localStorage.getItem('h3d_bg_customImageName');
                 storedCustomVideoName = localStorage.getItem('h3d_bg_customVideoName');
@@ -549,6 +570,7 @@
             const fretColumnMarkerCadence = (storedFretColumnMarkerCadence == null)
                 ? DEFAULTS.fretColumnMarkerCadence
                 : coerceCadence(storedFretColumnMarkerCadence);
+            const inlayLabelsVisible = coerceBool(storedInlayLabelsVisible, DEFAULTS.inlayLabelsVisible);
             const customImageDataUrl = (typeof storedCustomImageDataUrl === 'string') ? storedCustomImageDataUrl : DEFAULTS.customImageDataUrl;
             const customImageName    = (typeof storedCustomImageName === 'string')    ? storedCustomImageName    : DEFAULTS.customImageName;
             const customVideoName    = (typeof storedCustomVideoName === 'string')    ? storedCustomVideoName    : DEFAULTS.customVideoName;
@@ -578,6 +600,7 @@
             const cdslbl= document.getElementById('h3d-chord-diagram-size-label');
             const cdpos = document.getElementById('h3d-chord-diagram-position');
             const fcmc  = document.getElementById('h3d-fret-column-marker-cadence');
+            const ilv   = document.getElementById('h3d-inlay-labels-visible');
             const fileInput = document.getElementById('h3d-bg-custom-image-file');
             const clearBtn  = document.getElementById('h3d-bg-custom-image-clear');
             const nameP     = document.getElementById('h3d-bg-custom-image-name');
@@ -610,6 +633,7 @@
             if (cdslbl) cdslbl.textContent = chordDiagramSize.toFixed(2);
             if (cdpos) cdpos.value  = chordDiagramPosition;
             if (fcmc)  fcmc.value   = String(fretColumnMarkerCadence);
+            if (ilv)   ilv.checked  = !inlayLabelsVisible;
 
             // Palette preview swatches. Mirror of PALETTES in screen.js —
             // KEEP IN SYNC. Settings panel paints these from the dropdown
