@@ -366,6 +366,24 @@
         </select>
     </div>
 
+    <!-- Fret-column reference markers cadence -->
+    <div class="mt-6 pt-4 border-t border-gray-800">
+        <label for="h3d-fret-column-marker-cadence" class="text-xs font-medium text-gray-400 mb-1 block">
+            Fret-column marker cadence (measures)
+        </label>
+        <input type="number" id="h3d-fret-column-marker-cadence" min="0" max="16" step="1" value="4"
+            onchange="window.h3dBgSetFretColumnMarkerCadence && window.h3dBgSetFretColumnMarkerCadence(this.value)"
+            class="w-24 bg-dark-700 border border-gray-800 rounded-lg px-3 py-2 text-xs text-gray-300 outline-none">
+        <p class="text-[10px] text-gray-500 mt-1">
+            How often a row of fret-number reference markers slides down
+            the highway floor as a visual cue mapping each X position to
+            its fret number. Frets 3, 5, 7, 9, 12 are shown when your
+            playing region is below the octave; 12 and odd frets above
+            are shown when above. Light grey when an upcoming note is in
+            that fret column, dark grey otherwise. Set to 0 to disable.
+        </p>
+    </div>
+
     <!-- Hydrate from localStorage on load. Mirror runtime defaults AND
          coercion rules from screen.js's BG_DEFAULTS / _bgCoerce so first-
          run users see what the renderer actually drew, and any garbage
@@ -374,7 +392,7 @@
          no-selection / NaN state. -->
     <script>
         (function () {
-            const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramSize: 0.5, chordDiagramPosition: 'tl' };
+            const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramSize: 0.5, chordDiagramPosition: 'tl', fretColumnMarkerCadence: 4 };
             const VALID_STYLES = new Set(['off', 'particles', 'silhouettes', 'lights', 'geometric', 'image', 'video']);
             const VALID_PALETTES = new Set(['default', 'neon', 'pastel']);
             const VALID_CHORD_DIAG_POSITIONS = new Set(['tl', 'tr', 'bl', 'br']);
@@ -451,6 +469,11 @@
                 if (v === 'false' || v === '0') return false;
                 return fallback;
             }
+            function coerceCadence(v) {
+                const n = parseInt(v, 10);
+                if (!Number.isFinite(n)) return DEFAULTS.fretColumnMarkerCadence;
+                return Math.max(0, Math.min(16, n));
+            }
 
             let storedStyle = null, storedI = null, storedR = null, storedPalette = null, storedFretOnNote = null;
             let storedCameraSmoothing = null;
@@ -465,6 +488,7 @@
             let storedGlow = null;
             let storedChordDiagramSize = null;
             let storedChordDiagramPosition = null;
+            let storedFretColumnMarkerCadence = null;
             try {
                 storedStyle = localStorage.getItem('h3d_bg_style');
                 storedI = localStorage.getItem('h3d_bg_intensity');
@@ -481,6 +505,7 @@
                 storedGlow = localStorage.getItem('h3d_bg_glow');
                 storedChordDiagramSize = localStorage.getItem('h3d_bg_chordDiagramSize');
                 storedChordDiagramPosition = localStorage.getItem('h3d_bg_chordDiagramPosition');
+                storedFretColumnMarkerCadence = localStorage.getItem('h3d_bg_fretColumnMarkerCadence');
                 storedCustomImageDataUrl = localStorage.getItem('h3d_bg_customImageDataUrl');
                 storedCustomImageName = localStorage.getItem('h3d_bg_customImageName');
                 storedCustomVideoName = localStorage.getItem('h3d_bg_customVideoName');
@@ -521,6 +546,9 @@
             const chordDiagramPosition = (storedChordDiagramPosition !== null && VALID_CHORD_DIAG_POSITIONS.has(storedChordDiagramPosition))
                 ? storedChordDiagramPosition
                 : DEFAULTS.chordDiagramPosition;
+            const fretColumnMarkerCadence = (storedFretColumnMarkerCadence == null)
+                ? DEFAULTS.fretColumnMarkerCadence
+                : coerceCadence(storedFretColumnMarkerCadence);
             const customImageDataUrl = (typeof storedCustomImageDataUrl === 'string') ? storedCustomImageDataUrl : DEFAULTS.customImageDataUrl;
             const customImageName    = (typeof storedCustomImageName === 'string')    ? storedCustomImageName    : DEFAULTS.customImageName;
             const customVideoName    = (typeof storedCustomVideoName === 'string')    ? storedCustomVideoName    : DEFAULTS.customVideoName;
@@ -549,6 +577,7 @@
             const cdsli = document.getElementById('h3d-chord-diagram-size');
             const cdslbl= document.getElementById('h3d-chord-diagram-size-label');
             const cdpos = document.getElementById('h3d-chord-diagram-position');
+            const fcmc  = document.getElementById('h3d-fret-column-marker-cadence');
             const fileInput = document.getElementById('h3d-bg-custom-image-file');
             const clearBtn  = document.getElementById('h3d-bg-custom-image-clear');
             const nameP     = document.getElementById('h3d-bg-custom-image-name');
@@ -580,6 +609,7 @@
             if (cdsli) cdsli.value  = String(chordDiagramSize);
             if (cdslbl) cdslbl.textContent = chordDiagramSize.toFixed(2);
             if (cdpos) cdpos.value  = chordDiagramPosition;
+            if (fcmc)  fcmc.value   = String(fretColumnMarkerCadence);
 
             // Palette preview swatches. Mirror of PALETTES in screen.js —
             // KEEP IN SYNC. Settings panel paints these from the dropdown

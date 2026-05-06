@@ -161,6 +161,25 @@
     const DDOTS = new Set([12, 24]);
     const INLAY_LABEL_FRETS = [3, 5, 7, 9, 12, 15, 17, 19, 22, 24]; // 22 not 21: intentional display choice
 
+    // Fret-column reference markers: floor-aligned fret-number sprites
+    // that scroll toward the hit line every Nth measure as a visual
+    // cue mapping X position to fret number. Frets 3/5/7/9/12 below
+    // the octave, then odd frets above. 12 is rendered if either side
+    // of the active range is populated.
+    const FRET_COLUMN_MARKER_FRETS = [3, 5, 7, 9, 12, 13, 15, 17, 19, 21, 23];
+
+    // Binary lower-bound: returns the first index i in arr where arr[i].t >= t.
+    // Assumes arr is sorted ascending by .t (bundle.notes / bundle.chords always are).
+    function lowerBoundT(arr, t) {
+        let lo = 0, hi = arr.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >>> 1;
+            if (arr[mid].t < t) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
     const FRET_COOLDOWN = 0.5; // seconds a lane fret stays active after last note
 
     const DIAG_LINGER_S    = 0.55;
@@ -376,7 +395,7 @@
         return _bgBandsCache;
     }
 
-    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramSize: 0.5, chordDiagramPosition: 'tl' };
+    const BG_DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramSize: 0.5, chordDiagramPosition: 'tl', fretColumnMarkerCadence: 4 };
     const BG_STYLE_IDS = ['off', 'particles', 'silhouettes', 'lights', 'geometric', 'image', 'video'];
 
     function _bgPanelKey(canvas) {
@@ -435,6 +454,11 @@
         if (key === 'palette') return PALETTE_IDS.includes(val) ? val : BG_DEFAULTS.palette;
         if (key === 'chordDiagramPosition')
             return CHORD_DIAG_POSITION_IDS.includes(val) ? val : BG_DEFAULTS.chordDiagramPosition;
+        if (key === 'fretColumnMarkerCadence') {
+            const n = parseInt(val, 10);
+            if (!Number.isFinite(n)) return BG_DEFAULTS.fretColumnMarkerCadence;
+            return Math.max(0, Math.min(16, n));
+        }
         return val;
     }
 
@@ -494,6 +518,7 @@
     window.h3dBgSetGlow     = (v) => _bgWriteGlobal('glow', v);
     window.h3dBgSetChordDiagramSize     = (v) => _bgWriteGlobal('chordDiagramSize', v);
     window.h3dBgSetChordDiagramPosition = (v) => _bgWriteGlobal('chordDiagramPosition', v);
+    window.h3dBgSetFretColumnMarkerCadence = (v) => _bgWriteGlobal('fretColumnMarkerCadence', v);
     // Custom image asset for the 'image' bg style (#19). Composite setter:
     // writes both the data URL (the bytes that drive the texture) and the
     // display filename, each emitting a change event. The listener
@@ -1294,6 +1319,12 @@
         let _diagPrevStartT       = null;  // bundle.currentTime when crossfade began (drives rewindable fade)
         let _diagEntranceT        = 1.0;
         let _diagLastKey          = null;  // chord identity: name + '|' + frets.join(',')
+        // Per-wave cache for fret-column reference markers. Keyed by the
+        // wave's beat timestamp. We snapshot { hasLow, hasHigh } at first
+        // sight of a wave so its render gate stays consistent through the
+        // wave's flight even as activeFrets shifts mid-song. Entries are
+        // pruned each frame once their wave has passed `now`.
+        let _fretMarkerWaveCache = new Map();
         let _lastHwW = 0, _lastHwH = 0;
         let mBeatM = null, mBeatQ = null;
         let txtCache = {};
@@ -1364,6 +1395,7 @@
         let glowMul             = BG_DEFAULTS.glow;
         let chordDiagramSize     = BG_DEFAULTS.chordDiagramSize;
         let chordDiagramPosition = BG_DEFAULTS.chordDiagramPosition;
+        let fretColumnMarkerCadence = BG_DEFAULTS.fretColumnMarkerCadence;
         let _vibrancyIdleOp = 0.4  + 0.6  * BG_DEFAULTS.vibrancy;
         let _vibrancyProjOp = 0.15 + 0.35 * BG_DEFAULTS.vibrancy;
         // Custom image asset (issue #19). Data URL is the bytes that
@@ -1408,6 +1440,7 @@
         let pFretLbl, pLane, pLaneDivider;
         let pChordBox, pChordLbl, pBarreLine;
         let pNoteFretLabel, pConnectorLine, pDropLine, pTechArrow, pTapChevron;
+        let pFretColMarker;
 
         // Dynamic glowing string meshes (BoxGeometry, one per string)
         let stringLines = [];
@@ -2303,6 +2336,12 @@
                 new T.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.35 }),
             ));
 
+            // Fret-column reference markers (visual cue for X-position to fret-number).
+            // Each sprite gets its own clone so the per-frame material.map swap
+            // (dark vs light grey) doesn't poison neighbours sharing the same
+            // cached texture map.
+            pFretColMarker = pool(lblG, () => new T.Sprite(txtMat('0', '#666666', false, 'noteFret').clone()));
+
             buildBoard();
 
             // Background animations (#13). Read settings keyed by this
@@ -2334,7 +2373,8 @@
                     changedKey === 'cameraSmoothing' || changedKey === 'zoomSmoothing' ||
                     changedKey === 'tiltSmoothing' || changedKey === 'cameraLockLow' ||
                     changedKey === 'cameraLockZoom' || changedKey === 'textSize' ||
-                    changedKey === 'chordDiagramSize' || changedKey === 'chordDiagramPosition') {
+                    changedKey === 'chordDiagramSize' || changedKey === 'chordDiagramPosition' ||
+                    changedKey === 'fretColumnMarkerCadence') {
                     // Flag flips don't need a mesh rebuild — just refresh
                     // the per-instance state for the next frame to consult.
                     // Same shape for showFretOnNote (#12), cameraSmoothing
@@ -2527,6 +2567,7 @@
             glowMul              = _bgReadSetting(panelKey, 'glow');
             chordDiagramSize     = _bgReadSetting(panelKey, 'chordDiagramSize');
             chordDiagramPosition = _bgReadSetting(panelKey, 'chordDiagramPosition');
+            fretColumnMarkerCadence = _bgReadSetting(panelKey, 'fretColumnMarkerCadence');
             _vibrancyIdleOp = 0.4  + 0.6  * vibrancy;
             _vibrancyProjOp = 0.15 + 0.35 * vibrancy;
             // Custom image asset is a single GLOBAL slot — bytes are
@@ -2920,6 +2961,7 @@
             if (projGlowArr) for (const m of projGlowArr) m.visible = false;
             pFretLbl.reset(); pLane.reset(); pLaneDivider.reset();
             pChordBox.reset(); pChordLbl.reset(); pBarreLine.reset(); pNoteFretLabel.reset(); pConnectorLine.reset(); pDropLine.reset();
+            pFretColMarker.reset();
             _ndLabels = [];
 
             // Prune expired notedetect marks once per frame instead of
@@ -3418,6 +3460,106 @@
                     sp.material = txtMat(s.name, '#00cccc', true, 'section');
                     sp.scale.set(20 * K * _textSizeMul, 5 * K * _textSizeMul, 1);
                     sp.position.set(fretX(12), labelY, dZ(s.time - now));
+                }
+            }
+
+            // ── Fret-column reference markers ─────────────────────────────
+            // Every Nth measure, spawn a row of fret-number sprites on the
+            // board floor that scroll toward the hit line and vanish at Z=0.
+            // Visual cue mapping X-position on the highway to fret number,
+            // gated by the active-fret range so unused frets don't clutter
+            // the view. Light grey when that fret is currently in the
+            // active set (upcoming notes / cooldown), dark grey otherwise.
+            //
+            // Per-wave gate cache: hasLow/hasHigh is snapshotted at first
+            // sight of a wave so the render decision stays stable through
+            // the wave's full flight. Without this, activeFrets shifting
+            // mid-song would drop markers mid-flight (user-reported bug:
+            // "numbers disappear before they get all the way towards me").
+            if (beats && fretColumnMarkerCadence > 0) {
+                // Prune stale wave cache entries (wave already past now).
+                if (_fretMarkerWaveCache.size > 0) {
+                    for (const k of _fretMarkerWaveCache.keys()) {
+                        if (k < now) _fretMarkerWaveCache.delete(k);
+                    }
+                }
+                const minStringY = Math.min(sY(0), sY(nStr - 1));
+                const labelY = minStringY - S_GAP * 0.8;
+                for (const b of beats) {
+                    // Non-downbeats are encoded as measure=-1; only actual
+                    // measure starts (measure >= 0) can spawn marker waves.
+                    if (b.measure < 0) continue;
+                    if (b.time < 0 || b.time > t1) continue;
+                    if (b.time <= now) continue;
+                    if ((b.measure | 0) % fretColumnMarkerCadence !== 0) continue;
+
+                    // Snapshot the active-range gate at first sight of this
+                    // wave. We scan notes/chords in a 2s window starting at
+                    // b.time rather than activeFrets, because activeFrets only
+                    // covers now+2s and waves first become visible up to
+                    // AHEAD (3s) ahead — using activeFrets would cache
+                    // {hasLow:false, hasHigh:false} for far waves and suppress
+                    // the entire row for its full flight.
+                    let cached = _fretMarkerWaveCache.get(b.time);
+                    if (!cached) {
+                        let hasLow = false, hasHigh = false;
+                        const wT0 = b.time, wT1 = b.time + 2;
+                        // notes and chords are time-sorted; binary-search to the
+                        // first entry >= wT0, then break once past wT1 to avoid
+                        // O(song_length) work per newly-seen wave.
+                        if (notes) {
+                            const startI = lowerBoundT(notes, wT0);
+                            for (let i = startI; i < notes.length; i++) {
+                                const n = notes[i];
+                                if (n.t > wT1) break;
+                                if (!validString(n.s) || n.f <= 0) continue;
+                                if (n.f <= 12) hasLow = true; else hasHigh = true;
+                                if (hasLow && hasHigh) break;
+                            }
+                        }
+                        if ((!hasLow || !hasHigh) && chords) {
+                            const startI = lowerBoundT(chords, wT0);
+                            outer: for (let i = startI; i < chords.length; i++) {
+                                const ch = chords[i];
+                                if (ch.t > wT1) break outer;
+                                if (!ch.notes) continue;
+                                for (const cn of ch.notes) {
+                                    if (!validString(cn.s) || cn.f <= 0) continue;
+                                    if (cn.f <= 12) hasLow = true; else hasHigh = true;
+                                    if (hasLow && hasHigh) break outer;
+                                }
+                            }
+                        }
+                        cached = { hasLow, hasHigh };
+                        _fretMarkerWaveCache.set(b.time, cached);
+                    }
+                    if (!cached.hasLow && !cached.hasHigh) continue;
+
+                    const dt = b.time - now;
+                    const z = dZ(dt);
+                    // Distance compensation: grow world-scale linearly
+                    // with dt so perspective foreshortening doesn't make
+                    // far markers tiny.
+                    const distScale = 1 + Math.min(1, dt / AHEAD) * 1.2;
+                    for (const f of FRET_COLUMN_MARKER_FRETS) {
+                        let show;
+                        if (f === 12) show = cached.hasLow || cached.hasHigh;
+                        else if (f < 12) show = cached.hasLow;
+                        else show = cached.hasHigh;
+                        if (!show) continue;
+                        const lit = activeFrets.has(f);
+                        const color = lit ? '#bbbbbb' : '#666666';
+                        const sp = pFretColMarker.get();
+                        const m = txtMat(f, color, false, 'noteFret');
+                        if (sp.material.map !== m.map) {
+                            sp.material.map = m.map;
+                            sp.material.needsUpdate = true;
+                        }
+                        sp.material.opacity = 0.85;
+                        sp.position.set(fretMid(f), labelY, z);
+                        const sz = NH * 3.8 * _textSizeMul * distScale;
+                        sp.scale.set(sz, sz, 1);
+                    }
                 }
             }
 
@@ -4110,6 +4252,8 @@
             mBeatM = mBeatQ = null;
             pNote = pSus = pSusOutline = pLbl = pBeat = pSec = null;
             pFretLbl = pLane = pLaneDivider = pChordBox = pChordLbl = pBarreLine = pNoteFretLabel = pConnectorLine = pDropLine = pTechArrow = pTapChevron = null;
+            pFretColMarker = null;
+            _fretMarkerWaveCache.clear();
             gNote = gSus = gBeat = gTechArrow = gTapChevron = null;
             tgtX = curX = 0; tgtDist = curDist = CAM_DIST_BASE; tgtLookY = curLookY = 0; nStr = NSTR; _oobStringWarned = false;
             prevLowFretBonus = 0;
