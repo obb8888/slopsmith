@@ -5,3 +5,7 @@
 # dishonest. Scoped narrowly to the bundle (not the whole vendor dir)
 # so LICENSE / VERSION stay diff-readable for future version bumps.
 static/vendor/three/three.module.min.js binary
+
+# PSARC test fixtures are zlib-compressed binary archives — diffs and
+# autocrlf rewrites would corrupt them.
+tests/fixtures/*.psarc binary
