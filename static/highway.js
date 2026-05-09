@@ -258,6 +258,10 @@ function createHighway() {
             sections,
             chordTemplates,
             stringCount,
+            // Mirrors song_info tuning capo offsets (±semitones from the
+            // instrument’s standard open-string layout). Live reference.
+            tuning: songInfo?.tuning,
+            capo: songInfo?.capo,
             lyrics,
             toneChanges,
             toneBase,

@@ -438,16 +438,17 @@
         <label for="h3d-fret-column-marker-cadence" class="text-xs font-medium text-gray-400 mb-1 block">
             Fret-column marker cadence (measures)
         </label>
-        <input type="number" id="h3d-fret-column-marker-cadence" min="0" max="16" step="1" value="4"
+        <input type="number" id="h3d-fret-column-marker-cadence" min="0" max="16" step="1" value="2"
             onchange="window.h3dBgSetFretColumnMarkerCadence && window.h3dBgSetFretColumnMarkerCadence(this.value)"
             class="w-24 bg-dark-700 border border-gray-800 rounded-lg px-3 py-2 text-xs text-gray-300 outline-none">
         <p class="text-[10px] text-gray-500 mt-1">
             How often a row of fret-number reference markers slides down
-            the highway floor as a visual cue mapping each X position to
-            its fret number. Frets 3, 5, 7, 9, 12 are shown when your
-            playing region is below the octave; 12 and odd frets above
-            are shown when above. Light grey when an upcoming note is in
-            that fret column, dark grey otherwise. Set to 0 to disable.
+            the highway floor. With a chart &lt;anchor&gt;, the row uses the
+            inlay cadence (3,5,7,9,12,15,…) around the anchor fret—about
+            two marker steps back and three forward (e.g. anchor 7 shows
+            3,5,7,9,12,15). Without anchors, every cadence fret is eligible.
+            Light grey when an upcoming note uses that fret column, dark
+            grey otherwise. Set to 0 to disable.
         </p>
     </div>
 
@@ -478,7 +479,7 @@
          no-selection / NaN state. -->
     <script>
         (function () {
-            const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramSize: 0.5, chordDiagramPosition: 'tl', fretColumnMarkerCadence: 4, inlayLabelsVisible: true, sectionLabelsOnHighway: false, sectionHudVisible: true, sectionHudPosition: 'tr', sectionHudSize: 0.5 };
+            const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: false, cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramSize: 0.5, chordDiagramPosition: 'tl', fretColumnMarkerCadence: 2, inlayLabelsVisible: false, sectionLabelsOnHighway: false, sectionHudVisible: true, sectionHudPosition: 'tr', sectionHudSize: 0.5 };
             const VALID_STYLES = new Set(['off', 'particles', 'silhouettes', 'lights', 'geometric', 'image', 'video']);
             const VALID_PALETTES = new Set(['default', 'neon', 'pastel']);
             const VALID_CHORD_DIAG_POSITIONS = new Set(['tl', 'tr', 'bl', 'br']);
