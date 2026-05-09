@@ -2144,13 +2144,17 @@ function createHighway() {
                                             // _onReady / song:ready fire.
                                             const audioUrl = msg.audio_url;
                                             _juceRoutingPromise = (async () => {
+                                                let pathLabel = '<missing>';
                                                 try {
                                                     if (await juceApi.isAudioRunning()) {
                                                         if (gen !== _wsGen) return; // stale
                                                         const res = await fetch(`/api/audio-local-path?url=${encodeURIComponent(audioUrl)}`);
                                                         if (!res.ok) throw new Error('HTTP ' + res.status);
                                                         const { path } = await res.json();
-                                                        await juceApi.loadBackingTrack(path);
+                                                        pathLabel = (typeof path === 'string' && path.split(/[\\/]/).pop()) || '<missing>';
+                                                        const ok = await juceApi.loadBackingTrack(path);
+                                                        console.log('[highway] JUCE loadBackingTrack file=', pathLabel, 'ok=', ok);
+                                                        if (ok === false) throw new Error('JUCE rejected backing track: ' + pathLabel);
                                                         if (gen !== _wsGen) return; // stale
                                                         if (window.jucePlayer) window.jucePlayer._dur = await juceApi.getBackingDuration();
                                                         if (gen !== _wsGen) return; // stale
@@ -2161,7 +2165,7 @@ function createHighway() {
                                                         return;
                                                     }
                                                 } catch (err) {
-                                                    console.warn('[highway] JUCE audio routing failed, falling back to HTML5:', err);
+                                                    console.warn('[highway] JUCE audio routing failed, falling back to HTML5 file=', pathLabel, err);
                                                     if (gen !== _wsGen) return; // stale
                                                     window._juceMode = false;
                                                     window._juceAudioUrl = null;
