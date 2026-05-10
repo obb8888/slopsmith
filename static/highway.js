@@ -27,6 +27,45 @@ function createHighway() {
     let chartTime = 0;
     let currentTime = 0;
     let avOffsetSec = 0;
+    // Monotonic getTime support: between setTime() calls, getTime()
+    // interpolates forward using performance.now() so plugins observe a
+    // smooth sub-frame clock instead of the coarse step-quantization
+    // that audio.currentTime exposes (browsers don't refresh the
+    // reported value every audio frame — the practical gap between
+    // distinct readings is closer to 20+ ms in Chrome/Firefox even
+    // though the underlying audio thread runs much faster). The anchor
+    // only updates when setTime() receives a
+    // genuinely new value — repeated calls with the same chartTime
+    // (e.g. browser hasn't refreshed audio.currentTime yet) keep the
+    // anchor's perfNow fixed so interpolation continues from the right
+    // origin instead of stuttering.
+    // NaN sentinel for "no prior anchor" so the very first setTime call
+    // always triggers the re-anchor branch — even setTime(0) on the
+    // initial 60 Hz tick. Plain 0 would compare equal to setTime(0) and
+    // skip the branch, leaving _chartAnchorPerfNow uninitialized and
+    // causing getTime() to return NaN.
+    let _chartAnchorAudioT = NaN;
+    let _chartAnchorPerfNow = NaN;
+    // Pause detection: the 60Hz tick in app.js keeps calling setTime()
+    // even while paused (with a stalled audio clock). Track when t last
+    // ADVANCED (not just when setTime was called) — if it's been still
+    // for a while, audio is paused and getTime() should return raw
+    // chartTime instead of interpolating forward against silent audio.
+    // Independent of song:* events — avoids the edge cases where the
+    // pause listener early-returns and never emits.
+    let _chartLastAdvanceAt = 0;
+    // Observed playback rate, derived from the actual delta between
+    // successive anchor updates. Slopsmith's speed slider (audio
+    // playbackRate != 1) means audio time advances slower/faster than
+    // real time; interpolating with a fixed 1x rate would drift. Each
+    // re-anchor refines the estimate from the latest segment. Default
+    // to 1 until we have two anchors to compare.
+    let _chartObservedRate = 1;
+    // Cap the interpolation so a stalled main thread (long task, GC,
+    // dropped tick) can't make getTime drift far past reality. Also the
+    // threshold for "audio looks paused" — if setTime hasn't advanced t
+    // in this long, treat as paused.
+    const _CHART_MAX_INTERP_MS = 100;
     let animFrame = null;
     let _connectOpts = {};
     let _resizeContainer = null;
@@ -2303,7 +2342,47 @@ function createHighway() {
             };
         },
 
-        setTime(t) { chartTime = t; currentTime = t + avOffsetSec; },
+        setTime(t) {
+            chartTime = t;
+            currentTime = t + avOffsetSec;
+            // Only re-anchor on a genuinely new audio time. Repeated
+            // calls with the same `t` (audio.currentTime hasn't updated
+            // yet) keep the anchor's perfNow fixed so interpolation
+            // continues smoothly between audio updates. Tracking
+            // _chartLastAdvanceAt here too lets getTime() detect when
+            // the audio clock has stalled (= paused) without coupling
+            // to song:* events.
+            if (t !== _chartAnchorAudioT) {
+                const newPerfNow = performance.now();
+                // Derive observed rate from this anchor segment so
+                // interpolation respects speed slider changes (and
+                // any DSP-induced rate drift). Skip refresh on the
+                // initial anchor (no prior segment) and on near-zero
+                // dt (would divide by ~0). Clamp to a sane window so
+                // a noisy seek doesn't poison the estimate.
+                const hadPriorAnchor = !Number.isNaN(_chartAnchorPerfNow);
+                const dPerf = hadPriorAnchor ? (newPerfNow - _chartAnchorPerfNow) / 1000 : 0;
+                if (hadPriorAnchor && dPerf > 0.001 && dPerf < 0.5) {
+                    const observed = (t - _chartAnchorAudioT) / dPerf;
+                    if (observed > 0.05 && observed < 5) {
+                        _chartObservedRate = observed;
+                    } else {
+                        // Out-of-band rate (seek discontinuity, loop wrap,
+                        // negative jump back). We can't measure rate from
+                        // this segment, so reset to 1 instead of carrying
+                        // a stale estimate from the prior segment.
+                        _chartObservedRate = 1;
+                    }
+                } else if (hadPriorAnchor && dPerf >= 0.5) {
+                    // Long gap between anchor updates — anchor was stale
+                    // (paused, tab inactive, seek). Same reset.
+                    _chartObservedRate = 1;
+                }
+                _chartAnchorAudioT = t;
+                _chartAnchorPerfNow = newPerfNow;
+                _chartLastAdvanceAt = newPerfNow;
+            }
+        },
         setAvOffset(ms) { avOffsetSec = (Number(ms) || 0) / 1000; currentTime = chartTime + avOffsetSec; },
         getAvOffset() { return avOffsetSec * 1000; },
 
@@ -2326,7 +2405,33 @@ function createHighway() {
         },
 
         getBeats() { return beats; },
-        getTime() { return chartTime; },
+        // Returns the chart clock smoothed via performance.now()
+        // interpolation while audio is actively advancing — sub-frame
+        // accurate even though audio.currentTime updates only ~every
+        // 23 ms. When audio is paused/stalled (setTime keeps being
+        // called with the same t for >100 ms), returns raw chartTime
+        // so plugins don't see a clock drifting forward against silent
+        // audio.
+        getTime() {
+            // No anchor yet (called before the first setTime, e.g. during
+            // early boot before the 60 Hz tick has fired): just return
+            // chartTime. Without this guard, elapsedMs would be NaN and
+            // the rate-scaled return would propagate NaN to plugins.
+            if (Number.isNaN(_chartAnchorPerfNow)) return chartTime;
+            const nowP = performance.now();
+            // If t hasn't advanced for a while, audio is paused or the
+            // tick has stopped — trust the raw chartTime.
+            if (nowP - _chartLastAdvanceAt > _CHART_MAX_INTERP_MS) return chartTime;
+            const elapsedMs = nowP - _chartAnchorPerfNow;
+            // Same cap as a backstop for the "long main-thread task"
+            // case — audio briefly advanced just before the stall, so
+            // we'd interpolate beyond what reality permits.
+            if (elapsedMs > _CHART_MAX_INTERP_MS) return chartTime;
+            // Scale by the observed playback rate so getTime stays
+            // accurate across slowdowns / speedups (audio.playbackRate
+            // != 1 is a first-class slopsmith feature).
+            return _chartAnchorAudioT + (_chartObservedRate * elapsedMs) / 1000;
+        },
         // Returns the slopsmith <audio> element so plugins don't have to
         // reach for `document.getElementById('audio')` directly. In JUCE
         // mode the same element is shimmed: `audio.currentTime` reads
@@ -2426,6 +2531,15 @@ function createHighway() {
                 window.removeEventListener('resize', _resizeHandler);
                 _resizeHandler = null;
             }
+            // No song:* listeners to tear down — the monotonic clock
+            // detects pause via setTime call patterns, not events.
+            // Reset the anchor state so a fresh init/connect cycle
+            // doesn't see stale advance timestamps from the previous
+            // session, and reset the observed rate to the 1x default.
+            _chartAnchorAudioT = NaN;
+            _chartAnchorPerfNow = NaN;
+            _chartLastAdvanceAt = 0;
+            _chartObservedRate = 1;
             // Release the renderer's GPU / DOM / event-listener resources
             // when leaving the player — anything it allocated in init()
             // should be torn down here so navigating away doesn't leak.
