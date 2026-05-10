@@ -1,11 +1,12 @@
 {
   "name": "slopsmith-browser-tests",
   "version": "1.0.0",
-  "description": "Browser tests for Slopsmith keyboard shortcuts",
+  "description": "Browser tests for Slopsmith keyboard shortcuts and JS plugin-API contract tests under tests/js/.",
   "scripts": {
     "test": "playwright test",
     "test:headed": "playwright test --headed",
     "test:debug": "playwright test --debug",
+    "test:js": "node --test tests/js/*.test.js",
     "install:playwright": "playwright install chromium"
   },
   "devDependencies": {

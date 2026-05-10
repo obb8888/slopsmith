@@ -3741,6 +3741,10 @@ async function startCountIn() {
             _audioSeek(loopA).then(() => {
                 lastAudioTime = loopA;
                 highway.setTime(loopA);
+                // Emit before beginCount so plugins that capture per-iteration
+                // state (notedetect drill-mode score capture) see the wrap at
+                // the same moment chartTime resets, not after the 4-beat count.
+                window.slopsmith.emit('loop:restart', { loopA, loopB, time: loopA });
                 beginCount();
             });
         }
