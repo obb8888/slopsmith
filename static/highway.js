@@ -66,6 +66,15 @@ function createHighway() {
     // threshold for "audio looks paused" — if setTime hasn't advanced t
     // in this long, treat as paused.
     const _CHART_MAX_INTERP_MS = 100;
+    // Visibility-aware rAF (slopsmith#246): when the canvas is hidden
+    // (display:none on itself or any ancestor — e.g. splitscreen's
+    // workaround), pause renderer.draw and emit highway:visibility on
+    // transitions so renderers that mount sibling DOM (3D Highway's
+    // .h3d-wrap overlay) can hide it. _visibleOverride !== null forces
+    // the state for hosts that hide via opacity / visibility / clipping
+    // where offsetParent === null isn't enough.
+    let _visibleOverride = null;
+    let _lastVisible = null;
     let animFrame = null;
     let _connectOpts = {};
     let _resizeContainer = null;
@@ -518,6 +527,12 @@ function createHighway() {
         try { api.resize(); }
         catch (e) { console.error('resize after canvas replace:', e); }
         _currentCanvasContextType = newType;
+        // The visibility cache is per-canvas-instance: a freshly
+        // attached canvas could be in a different displayed state
+        // than the one it replaced, and _lastVisible would otherwise
+        // suppress the first transition. Reset to null so the next
+        // rAF tick re-emits unconditionally.
+        _lastVisible = null;
         // Defensive notify for plugins / overlays that cache the
         // canvas element across events. Lazy lookups via
         // getElementById('highway') do not need this — they'll pick
@@ -684,9 +699,40 @@ function createHighway() {
         }
     }
 
+    // Visibility check (#246). offsetParent === null catches display:none
+    // on the canvas OR any ancestor — the splitscreen case. Doesn't
+    // catch visibility:hidden / opacity:0 / off-screen transforms;
+    // hosts that need those use setVisible() instead.
+    function _isHighwayVisible() {
+        if (_visibleOverride !== null) return _visibleOverride;
+        return !!(canvas && canvas.offsetParent !== null);
+    }
+
+    // Emit only on transition so renderer-side listeners aren't woken
+    // every frame. The first call after init emits a transition from
+    // null → boolean — that's the documented contract: "fired on
+    // transitions including the first one."
+    function _emitVisibilityIfChanged() {
+        const v = _isHighwayVisible();
+        if (v === _lastVisible) return;
+        _lastVisible = v;
+        if (typeof window !== 'undefined'
+            && window.slopsmith
+            && typeof window.slopsmith.emit === 'function') {
+            window.slopsmith.emit('highway:visibility', { visible: v, canvas });
+        }
+    }
+
     function draw() {
         animFrame = requestAnimationFrame(draw);
         if (!canvas || !_renderer) return;
+        // Visibility-aware skip (#246). Run BEFORE the !ready bail so
+        // hide/show transitions during the loading / reconnect window
+        // still propagate to listeners (a splitscreen-driven hide that
+        // straddles a song change would otherwise leave 3D Highway's
+        // overlay visible across the not-ready frames).
+        _emitVisibilityIfChanged();
+        if (!_lastVisible) return;
         // Match pre-refactor behaviour: skip draw until WS ready fires.
         // This gates out the brief "arrays cleared, WS reconnecting"
         // window during playSong / reconnect. Renderers that want to
@@ -2439,6 +2485,26 @@ function createHighway() {
         // `audio.play/pause` route to the JUCE backing engine — so the
         // returned element behaves uniformly regardless of mode.
         getAudioElement() { return document.getElementById('audio'); },
+        // Force the highway's visibility state for the rAF skip
+        // (#246). Pass `true` or `false` to override; pass `null` to
+        // clear the override and resume DOM-based detection via
+        // canvas.offsetParent. Useful for hosts that hide the highway
+        // via `visibility:hidden`, `opacity:0`, transforms, or other
+        // means that offsetParent doesn't catch. Emits any resulting
+        // transition immediately rather than waiting for the next
+        // rAF tick.
+        setVisible(v) {
+            _visibleOverride = (v === null || v === undefined) ? null : !!v;
+            _emitVisibilityIfChanged();
+        },
+        // Snapshot of the current visibility state (the override if
+        // set, else the live DOM check). Renderers that bind to
+        // `highway:visibility` after a transition has already happened
+        // can call this once to sync their initial state — the event
+        // is transition-only and won't re-fire for late subscribers.
+        isVisible() {
+            return _isHighwayVisible();
+        },
         getNotes() { return notes; },
         getChords() { return chords; },
         // Live reference to the chord-template lookup table —

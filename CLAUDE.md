@@ -196,6 +196,17 @@ Selecting this plugin in the main-player viz picker — or in splitscreen's per-
     });
     ```
     Plugins that re-query `document.getElementById('highway')` lazily inside their own event handlers don't need this listener — they pick up the new element automatically (it keeps `id="highway"`).
+  - **`highway:visibility`** — fired on `window.slopsmith` whenever the highway canvas transitions between displayed and hidden. Detection is DOM-based via `canvas.offsetParent === null` (catches `display:none` on the canvas or any ancestor — e.g. splitscreen's `#highway` hide) or whatever a host explicitly sets via `highway.setVisible(bool)`. While `visible === false`, core skips the rAF `renderer.draw(bundle)` call AND the default 2D draw, so renderers don't have to no-op themselves. The event is emitted only on transitions (including the first one after `init()`), not every frame. Payload `{ visible, canvas }` lives on `event.detail`:
+    ```js
+    window.slopsmith.on('highway:visibility', (event) => {
+        const { visible, canvas } = event.detail;
+        // Toggle any sibling DOM your renderer mounts. The 3D Highway
+        // renderer hides its `.h3d-wrap` overlay here so `display:none`
+        // on `#highway` actually hides the visible output.
+    });
+    ```
+    Renderers that only paint to the slopsmith canvas don't need this listener — the rAF skip is enough. Renderers that mount sibling DOM (separate WebGL contexts, overlays, etc.) do.
+  - **`highway.setVisible(bool | null)`** — forces the visibility state regardless of `offsetParent`. Pass `null` to clear the override and resume DOM-based detection. Useful when the host hides the highway via `visibility:hidden`, `opacity:0`, transforms, or clipping rather than `display:none`. The override re-emits any resulting transition immediately rather than waiting for the next rAF tick.
   - Default-renderer ctx is closure-cached. The replace path nulls the closure ctx so stale draw paths short-circuit; the next default-renderer `init()` re-acquires the 2D context from the new canvas cleanly.
 - `draw(bundle)` receives difficulty-filtered arrays — never read from `_filteredNotes` or other internals.
 - `_drawHooks` fire for the default 2D renderer (the factory calls them at the end of each frame). Custom WebGL renderers that maintain a 2D overlay canvas (like the bundled 3D highway) also call `window.highway.fireDrawHooks(ctx, W, H)` on that overlay so overlay plugins continue to work regardless of which renderer is active. Custom renderers without a 2D overlay context should not attempt to fire hooks.
