@@ -118,6 +118,12 @@ function createHighway() {
     let _filteredAnchors = null;
     let showLyrics = localStorage.getItem('showLyrics') !== 'false';
     let _drawHooks = [];  // plugin draw callbacks: fn(ctx, W, H)
+    // slopsmith#254 — per-note judgment overlay. A plugin (note_detect)
+    // registers fn(note, chartTime) -> 'hit' | 'active' | 'miss' | null
+    // (or { state, alpha?, color? }); renderers consult it per visible
+    // note so the gem itself can light up / a held sustain can glow,
+    // instead of relying on a separate overlay ring. null = no provider.
+    let _noteStateProvider = null;
     let _renderScale = parseFloat(localStorage.getItem('renderScale') || '1');  // 1 = full, 0.5 = half res
     let _inverted = localStorage.getItem('invertHighway') === 'true';
     let _lefty = localStorage.getItem('lefty') === '1';
@@ -245,6 +251,121 @@ function createHighway() {
         ctx.restore();
     }
 
+    // ── Per-note judgment state (slopsmith#254) ──────────────────────────
+    // Resolves the registered provider for one chart note. Returns null
+    // when no provider is set, the provider throws, it reports nothing,
+    // or the reported alpha is non-positive. Otherwise a normalized
+    // { state: 'hit'|'active'|'miss', alpha: 0..1, color: string|null }.
+    // 'hit' and 'active' are both "lit" — renderers may treat them the
+    // same; the distinction (struck note vs currently-held sustain) is
+    // there for renderers that want it. The provider owns all timing /
+    // fade — `alpha` is whatever intensity it wants right now.
+    function _noteState(note, chartTime) {
+        if (!_noteStateProvider) return null;
+        let raw;
+        try { raw = _noteStateProvider(note, chartTime); } catch (e) { return null; }
+        if (!raw) return null;
+        const state = typeof raw === 'string' ? raw : raw.state;
+        if (state !== 'hit' && state !== 'active' && state !== 'miss') return null;
+        const alpha = (raw && typeof raw === 'object' && Number.isFinite(raw.alpha))
+            ? Math.max(0, Math.min(1, raw.alpha))
+            : 1;
+        if (alpha <= 0) return null;
+        const color = (raw && typeof raw === 'object' && typeof raw.color === 'string') ? raw.color : null;
+        return { state, alpha, color };
+    }
+
+    // Paints the judgment effect on top of an already-drawn gem at
+    // (cx,cy) with half-extent `r`. `ns` is the normalized state from
+    // _noteState (or null → no-op). A miss → faint red wash. A correct
+    // hit / held sustain → a "sizzle": throbbing additive halo + a
+    // flickering white-hot core + crackling spark lines re-randomised
+    // each frame + (for a fresh struck note that's fading) an expanding
+    // shockwave ring. Intensity scales with `ns.alpha`, so a struck
+    // note flares and dies while a held sustain crackles continuously.
+    // Caller draws the gem normally first, then calls this BEFORE any
+    // glyph so a readable fret number can land on top.
+    function _paintGemGlow(cx, cy, r, stringIdx, ns) {
+        if (!ns || !ctx) return;
+        ctx.save();
+        if (ns.state === 'miss') {
+            ctx.globalAlpha = 0.4 * ns.alpha;
+            ctx.fillStyle = '#ff2828';
+            ctx.beginPath();
+            ctx.arc(cx, cy, r * 1.05, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+            return;
+        }
+        const col = ns.color || STRING_BRIGHT[stringIdx] || '#ffffff';
+        const a = ns.alpha;
+        const nowMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+        ctx.lineCap = 'round';
+
+        // Expanding shockwave — only on a fresh struck-and-fading hit
+        // (alpha decays 1→0). 'active' (held sustain, alpha pinned 1) skips it.
+        if (ns.state === 'hit' && a < 1) {
+            const prog = 1 - a;                       // 0 at strike → 1 at fade-out
+            ctx.globalCompositeOperation = 'lighter';
+            ctx.globalAlpha = a * 0.85;
+            ctx.strokeStyle = col;
+            ctx.lineWidth = Math.max(1.5, r * 0.26 * a);
+            ctx.beginPath();
+            ctx.arc(cx, cy, r * (1.0 + prog * 2.7), 0, Math.PI * 2);
+            ctx.stroke();
+        }
+
+        // Throbbing halo (≈9 Hz wobble).
+        const pulse = 0.8 + 0.2 * Math.sin(nowMs / 18);
+        const haloR = r * 2.0 * pulse;
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.globalAlpha = a;
+        const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, haloR);
+        g.addColorStop(0, '#ffffff');
+        g.addColorStop(0.30, col);
+        g.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(cx, cy, haloR, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Crackle — short bright spark lines flicking out from the gem,
+        // re-randomised every frame so it shimmers.
+        const sparkCount = 6;
+        for (let i = 0; i < sparkCount; i++) {
+            if (Math.random() > 0.55 * a + 0.2) continue;     // intermittent
+            const ang = Math.random() * Math.PI * 2;
+            const inR = r * 0.45;
+            const len = r * (0.7 + Math.random() * 1.6) * (0.5 + 0.5 * a);
+            ctx.globalAlpha = a * (0.45 + Math.random() * 0.55);
+            ctx.strokeStyle = Math.random() < 0.5 ? '#ffffff' : col;
+            ctx.lineWidth = Math.max(1, r * (0.08 + Math.random() * 0.08));
+            ctx.beginPath();
+            ctx.moveTo(cx + Math.cos(ang) * inR, cy + Math.sin(ang) * inR);
+            ctx.lineTo(cx + Math.cos(ang) * (inR + len), cy + Math.sin(ang) * (inR + len));
+            ctx.stroke();
+        }
+
+        // Flickering white-hot core.
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.globalAlpha = a * (0.55 + Math.random() * 0.45);
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(cx, cy, r * (0.30 + Math.random() * 0.14), 0, Math.PI * 2);
+        ctx.fill();
+
+        // Crisp bright rim.
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.globalAlpha = a;
+        ctx.strokeStyle = col;
+        ctx.lineWidth = Math.max(2, r * 0.2);
+        ctx.beginPath();
+        ctx.arc(cx, cy, r * 0.95, 0, Math.PI * 2);
+        ctx.stroke();
+
+        ctx.restore();
+    }
+
     // ── Drawing ──────────────────────────────────────────────────────────
     //
     // slopsmith#36 — swappable renderers.
@@ -332,6 +453,15 @@ function createHighway() {
             // apply the mirror transform themselves on their own context.
             project,
             fretX,
+
+            // Per-note judgment overlay (slopsmith#254). Renderers call
+            // this per visible note / chord-note to find out whether a
+            // scorer (note_detect) has flagged it hit / actively-held /
+            // missed, so the gem itself can light up instead of relying
+            // on an overlay ring. Returns null when no provider is set
+            // or it reports nothing for this note; otherwise
+            // { state: 'hit'|'active'|'miss', alpha: 0..1, color: string|null }.
+            getNoteState: _noteState,   // stable reference — no per-frame allocation
         };
     }
 
@@ -878,7 +1008,12 @@ function createHighway() {
         ctx.stroke();
     }
 
-    function drawNote(W, H, x, y, scale, string, fret, opts) {
+    function drawNote(W, H, x, y, scale, string, fret, opts, ns) {
+        // ns (slopsmith#254): normalized judgment state from _noteState,
+        // or null/undefined. `lit` means render the gem in the bright
+        // string colour with an additive halo; a miss gets a faint red
+        // wash instead. ns absent → byte-for-byte the original render.
+        const lit = !!(ns && ns.state !== 'miss');
         const isHarmonic = opts?.hm || opts?.hp || false;
         const isPinchHarmonic = opts?.hp || false;
         const isChord = opts?.chord || false;
@@ -892,8 +1027,11 @@ function createHighway() {
         const accent = opts?.ac || false;
         const sz = Math.max(12, 80 * scale * (H / 900));
         const half = sz / 2;
-        const color = STRING_COLORS[string] || '#888';
-        const dark = STRING_DIM[string] || '#222';
+        // When lit, bump the body one step brighter and the backing-glow
+        // one step up from STRING_DIM, so even shapes that don't get the
+        // _paintGemGlow halo (the open-string bar) read as "lit".
+        const color = lit ? (ns.color || STRING_BRIGHT[string] || STRING_COLORS[string] || '#888') : (STRING_COLORS[string] || '#888');
+        const dark = lit ? (STRING_COLORS[string] || '#666') : (STRING_DIM[string] || '#222');
 
         if (sz < 6) {
             ctx.fillStyle = color;
@@ -915,6 +1053,9 @@ function createHighway() {
             ctx.fillStyle = color;
             roundRect(ctx, W/2 - hw, y - barH/2, hw * 2, barH, 2);
             ctx.fill();
+            // Judgment glow (slopsmith#254) — central halo on the bar.
+            // _paintGemGlow takes a half-extent; barH is the full bar height.
+            _paintGemGlow(W/2, y, barH * 0.5, string, ns);
             // "0" label
             const fontSize = Math.max(8, sz * 0.5) | 0;
             ctx.fillStyle = '#fff';
@@ -1016,6 +1157,11 @@ function createHighway() {
             roundRect(ctx, x - half, y - half, sz, sz, sz / 5);
             ctx.fill();
         }
+
+        // Judgment glow (slopsmith#254) — additive halo for a correct
+        // hit / held sustain, faint red wash for a miss. Drawn before
+        // the fret number so the number stays legible on top.
+        _paintGemGlow(x, y, isHarmonic ? half * 1.2 : half, string, ns);
 
         // Fret number
         const fontSize = Math.max(10, sz * 0.5) | 0;
@@ -1152,13 +1298,59 @@ function createHighway() {
             const sw0 = Math.max(2, 6 * p0.scale);
             const sw1 = Math.max(2, 6 * p1.scale);
 
-            ctx.fillStyle = STRING_DIM[n.s] || '#333';
-            ctx.beginPath();
-            ctx.moveTo(x0 - sw0, p0.y * H);
-            ctx.lineTo(x0 + sw0, p0.y * H);
-            ctx.lineTo(x1 + sw1, p1.y * H);
-            ctx.lineTo(x1 - sw1, p1.y * H);
-            ctx.fill();
+            // slopsmith#254 — a sustain that's currently being held
+            // correctly "sizzles" in the bright string colour (glow +
+            // flickering brightness + a crackling current down the
+            // middle); otherwise the usual dim trail. A miss is left dim
+            // (the gem / overlay marks the miss; a red trail would be
+            // noisy). Skip the lookup entirely when no provider is set —
+            // zero cost in the hot loop for the common case.
+            const ns = _noteStateProvider ? _noteState(n, n.t) : null;
+            const litTrail = !!(ns && ns.state !== 'miss');
+            const y0 = p0.y * H, y1 = p1.y * H;
+            if (litTrail) {
+                const a = ns.alpha;
+                const col = ns.color || STRING_BRIGHT[n.s] || STRING_COLORS[n.s] || '#666';
+                ctx.save();
+                ctx.fillStyle = col;
+                ctx.shadowColor = col;
+                ctx.shadowBlur = (8 + 6 * Math.random()) * a;          // shimmering glow
+                ctx.globalAlpha = (0.45 + 0.45 * a) * (0.78 + 0.22 * Math.random());
+                ctx.beginPath();
+                ctx.moveTo(x0 - sw0, y0);
+                ctx.lineTo(x0 + sw0, y0);
+                ctx.lineTo(x1 + sw1, y1);
+                ctx.lineTo(x1 - sw1, y1);
+                ctx.fill();
+                // Crackling "current" — a jittery white core line down
+                // the trail, re-randomised each frame.
+                ctx.shadowBlur = 0;
+                ctx.globalCompositeOperation = 'lighter';
+                ctx.globalAlpha = a * (0.55 + 0.45 * Math.random());
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = Math.max(1.5, sw0 * 0.5);
+                ctx.lineJoin = 'round';
+                ctx.lineCap = 'round';
+                ctx.beginPath();
+                const segs = 7;
+                for (let k = 0; k <= segs; k++) {
+                    const f = k / segs;
+                    const jx = (k === 0 || k === segs) ? 0 : (Math.random() - 0.5) * sw0 * 2.2;
+                    const xx = x0 + (x1 - x0) * f + jx;
+                    const yy = y0 + (y1 - y0) * f;
+                    if (k === 0) ctx.moveTo(xx, yy); else ctx.lineTo(xx, yy);
+                }
+                ctx.stroke();
+                ctx.restore();
+            } else {
+                ctx.fillStyle = STRING_DIM[n.s] || '#333';
+                ctx.beginPath();
+                ctx.moveTo(x0 - sw0, y0);
+                ctx.lineTo(x0 + sw0, y0);
+                ctx.lineTo(x1 + sw1, y1);
+                ctx.lineTo(x1 - sw1, y1);
+                ctx.fill();
+            }
         }
     }
 
@@ -1194,7 +1386,7 @@ function createHighway() {
             if (!p) continue;
 
             const x = fretX(n.f, p.scale, W);
-            drawNote(W, H, x, p.y * H, p.scale, n.s, n.f, n);
+            drawNote(W, H, x, p.y * H, p.scale, n.s, n.f, n, _noteStateProvider ? _noteState(n, n.t) : null);
             drawnNotes.push({ t: n.t, s: n.s, f: n.f, bn: n.bn || 0, x, y: p.y * H, scale: p.scale });
         }
 
@@ -1402,14 +1594,18 @@ function createHighway() {
             sorted.forEach((cn, j) => {
                 const x = fretX(cn.f, p.scale, W);
                 const ny = p.y * H - actualTotalH / 2 + j * actualSpread;
+                // slopsmith#254 — per-string judgment, keyed by the
+                // chord's chart time (matches how note_detect stores it).
+                const cnNs = _noteStateProvider ? _noteState(cn, ch.t) : null;
 
                 // Open-string-in-chord wide bar — only when the note has no
                 // technique flags. Otherwise fall back to drawNote so PM /
                 // H / P / T / tremolo / accent labels still render (drawNote
                 // is the only path that emits those labels).
                 if (getTemplateFret(cn) === 0 && hasMultipleNotes && !_noteHasTechniqueFlags(cn)) {
-                    const color = STRING_COLORS[cn.s] || '#888';
-                    const dark = STRING_DIM[cn.s] || '#222';
+                    const litBar = !!(cnNs && cnNs.state !== 'miss');
+                    const color = litBar ? (cnNs.color || STRING_BRIGHT[cn.s] || STRING_COLORS[cn.s] || '#888') : (STRING_COLORS[cn.s] || '#888');
+                    const dark = litBar ? (STRING_COLORS[cn.s] || '#666') : (STRING_DIM[cn.s] || '#222');
                     const barH = sz;
                     const barLeft = fretX(frameLeftFret, p.scale, W);
                     const barRight = fretX(frameRightFret, p.scale, W);
@@ -1419,6 +1615,7 @@ function createHighway() {
                     ctx.fillStyle = color;
                     roundRect(ctx, barLeft, ny - barH / 2, barRight - barLeft, barH, 2);
                     ctx.fill();
+                    _paintGemGlow((barLeft + barRight) / 2, ny, barH * 0.5, cn.s, cnNs);
                     const fontSize = Math.max(8, sz * 0.5) | 0;
                     ctx.fillStyle = '#fff';
                     ctx.font = `bold ${fontSize}px sans-serif`;
@@ -1426,7 +1623,7 @@ function createHighway() {
                     ctx.textBaseline = 'middle';
                     fillTextReadable('0', (barLeft + barRight) / 2, ny);
                 } else {
-                    drawNote(W, H, x, ny, p.scale, cn.s, cn.f, { ...cn, chord: true });
+                    drawNote(W, H, x, ny, p.scale, cn.s, cn.f, { ...cn, chord: true }, cnNs);
                 }
 
                 chordPositions.push({ s: cn.s, f: cn.f, bn: cn.bn || 0, x, y: ny, scale: p.scale });
@@ -2536,6 +2733,27 @@ function createHighway() {
         addDrawHook(fn) { _drawHooks.push(fn); },
         removeDrawHook(fn) { _drawHooks = _drawHooks.filter(h => h !== fn); },
         /**
+         * Register a per-note judgment-state provider (slopsmith#254).
+         * `fn(note, chartTime)` is called by renderers for each visible
+         * chart note and should return one of:
+         *   - falsy → no special state (render normally)
+         *   - 'hit'    — note was struck correctly (renderer lights the gem)
+         *   - 'active' — a sustained note is currently being held correctly
+         *   - 'miss'   — note was missed (renderer may red-wash the gem)
+         *   - { state: <one of the above>, alpha?: 0..1, color?: '#rrggbb' }
+         * The provider owns all timing/fade: return a decaying `alpha` for
+         * a struck-note glow, `alpha: 1` (or a bare string) for a held
+         * sustain, and stop returning state when the effect should end.
+         * `note` is the chart note object; for chord notes `chartTime` is
+         * the chord's time (so a `${time}_${s}_${f}` keyed lookup works).
+         * Pass `null` to clear. Only one provider is active at a time.
+         * Custom renderers read the same data via `bundle.getNoteState`.
+         */
+        setNoteStateProvider(fn) { _noteStateProvider = (typeof fn === 'function') ? fn : null; },
+        getNoteStateProvider() { return _noteStateProvider; },
+        /** Resolve the registered provider for one note (normalized). */
+        getNoteState(note, chartTime) { return _noteState(note, chartTime); },
+        /**
          * Fire all registered draw hooks on the given 2D context.
          * Custom renderers (e.g. the 3D highway) that maintain their own
          * 2D overlay canvas should call this after each frame so overlay
@@ -2634,6 +2852,18 @@ function createHighway() {
          * renderer; they're a 2D-only contract.
          */
         setRenderer(r) { _setRenderer(r); },
+        /**
+         * True when the built-in 2D canvas highway is the active renderer
+         * (or none has been installed yet — that resolves to the default
+         * on init). Overlay plugins that draw with the 2D-highway
+         * coordinate helpers (`project` / `fretX`) — note_detect's
+         * miss markers, etc. — should check this and skip rendering when
+         * a custom renderer (3D highway, piano, …) is active, since those
+         * geometries don't match and the renderer owns that feedback
+         * itself. Plugins that draw renderer-agnostic overlays (fretboard
+         * diagram, chord-label HUD) don't need this.
+         */
+        isDefaultRenderer() { return _renderer === _defaultRenderer || _renderer == null; },
     };
     return api;
 }

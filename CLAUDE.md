@@ -147,15 +147,29 @@ window.slopsmithViz_my_viz = function () {
             // notes, chords, anchors (all difficulty-filter-aware),
             // beats, sections, chordTemplates, stringCount, lyrics,
             // toneChanges, toneBase, mastery, hasPhraseData, inverted,
-            // lefty, renderScale, lyricsVisible, plus the 2D coordinate
-            // helpers project and fretX. `stringCount` is the active
-            // arrangement's string count (4 for bass, 6 for guitar,
-            // 7+ for extended-range GP imports — size string-indexed
-            // geometry against this, not a hardcoded 6). If your
-            // renderer needs lefty-aware text rendering, check
+            // lefty, renderScale, lyricsVisible, the 2D coordinate
+            // helpers project and fretX, and getNoteState (see below).
+            // `stringCount` is the active arrangement's string count (4
+            // for bass, 6 for guitar, 7+ for extended-range GP imports —
+            // size string-indexed geometry against this, not a hardcoded
+            // 6). If your renderer needs lefty-aware text rendering, check
             // bundle.lefty and apply the mirror transform yourself —
             // a bundle-level helper isn't provided because it would
             // need your renderer's own context, not the factory's.
+            //
+            // bundle.getNoteState(note, chartTime) (slopsmith#254) — call
+            // this per visible chart note / chord-note to find out whether
+            // a scorer (note_detect) has flagged it 'hit' / 'active' (a
+            // sustain currently being held correctly) / 'miss', so the gem
+            // itself can light up / a held sustain can glow instead of
+            // relying on an overlay ring. Returns null when no provider is
+            // registered or it reports nothing for this note; otherwise
+            // { state: 'hit'|'active'|'miss', alpha: 0..1, color: string|null }.
+            // For chord notes pass the chord's time (note_detect keys its
+            // judgments by `${time}_${string}_${fret}`). 'hit' and 'active'
+            // are both "lit" — a renderer may treat them identically; the
+            // provider owns all fade timing via `alpha` and by simply
+            // ceasing to return state when the effect should end.
         },
         resize(w, h) {
             // Optional. Canvas dims already updated; re-create WebGL
@@ -249,6 +263,7 @@ Overlays do NOT appear in the viz picker and do NOT declare `"type": "visualizat
 - **Own your rAF + canvas** — don't piggyback on `_drawHooks` or on `createHighway`'s rendering context. Draw hooks fire for the default 2D renderer and for custom renderers that explicitly call `window.highway.fireDrawHooks(ctx, W, H)` (e.g. the bundled 3D highway fires them on its 2D overlay canvas), but not for every custom renderer.
 - **Re-read state every frame** — overlay output must track whatever the current renderer is drawing. Don't cache note positions across frames.
 - **Respect lefty + invert toggles** — if the overlay depicts strings or frets, mirror using the same transforms the active renderer would.
+- **If you position with `highway.project` / `highway.fretX` (the 2D-highway geometry), gate on `highway.isDefaultRenderer()`** — those helpers describe the *built-in 2D* highway's depth curve and fret zoom. When a custom renderer (3D highway, piano, …) is active your draw hook still fires (on that renderer's 2D overlay layer), but those coordinates won't match its scene — markers land in arbitrary places. Skip rendering when `isDefaultRenderer()` is false; the custom renderer owns that feedback. Renderer-agnostic overlays (fretboard diagram, chord-label HUD — they use `getNotes()`/`getChordTemplates()` + their own layout) don't need this guard.
 - **Clean up on toggle-off** — cancel rAF and remove/hide the overlay canvas so inactive overlays aren't wasting frames.
 
 Reference: [fretboard plugin](https://github.com/byrongamatos/slopsmith-plugin-fretboard) — canonical overlay implementation (navbar toggle, own canvas, 80ms active-note window).
@@ -256,6 +271,32 @@ Reference: [fretboard plugin](https://github.com/byrongamatos/slopsmith-plugin-f
 **Why two?** setRenderer plugs into an existing highway — main-player or splitscreen-panel — reusing its WebSocket and data parsing, so the common "I want a different look for the same data" case is zero boilerplate AND multi-instance for free. Overlays compose with whatever renderer is active — they decorate rather than replace, so multiple can stack (fretboard + chord labels + practice feedback) without fighting over the canvas.
 
 A previous standalone-pane contract (`window.createMyVisualization({ container })` with its own WebSocket per pane) was used by splitscreen pre-Wave-C. It's been retired now that splitscreen calls `setRenderer` on per-panel `createHighway()` instances; if you find references in older plugin docs or external integration guides, those describe the legacy path.
+
+#### 3. Note-state provider — for scorers that want renderers to "light up" notes (slopsmith#254)
+
+A scoring plugin (note_detect) can publish a per-note judgment so whichever renderer is active draws the **gem itself** lit on a correct hit, and keeps a sustain trail glowing while it's still being played correctly — instead of a separate overlay ring floating near the note.
+
+```js
+// In the plugin (after resolving the highway instance):
+highway.setNoteStateProvider((note, chartTime) => {
+    // `note` is the chart note object ({ t, s, f, sus, ... }); for chord
+    // notes `chartTime` is the chord's time. Return one of:
+    //   - falsy  → no special state (render normally)
+    //   - 'hit'    — struck correctly; renderer lights the gem
+    //   - 'active' — a sustained note is right now being held correctly
+    //   - 'miss'   — missed; renderer may red-wash the gem
+    //   - { state: <one of the above>, alpha?: 0..1, color?: '#rrggbb' }
+    // You own all fade timing: return a decaying `alpha` for a struck-note
+    // glow, `alpha: 1` (or a bare string) for a held sustain, and stop
+    // returning state when the effect should end. Keep it cheap — it's
+    // called per visible note per renderer per frame.
+});
+// On teardown:  highway.setNoteStateProvider(null);
+```
+
+- Only one provider is active at a time (last `setNoteStateProvider` wins). `highway.getNoteStateProvider()` returns the current one (or null).
+- The built-in 2D highway consults it in `drawNote` / `drawSustains` / the chord-frame path: 'hit'/'active' → bright string colour + additive halo + a contained "sizzle" (crackling sparks, throbbing core, a shockwave ring on a fresh strike) on the gem and a bright (vs dim) sustain trail; 'miss' → faint red wash. The bundled **3D highway** reads the same data via `bundle.getNoteState` (bright string-tinted outline + bright body + glowing sustain + a contained sparkle hugging the note rect on hit/active; red outline + suppressed body on miss). Custom renderers that want it call `bundle.getNoteState(note, chartTime)` — it null-guards and returns the normalized `{ state, alpha, color }` (or null).
+- This is orthogonal to the overlay contract: note_detect remains an overlay (HUD, diagnostic miss markers, the "currently detected" indicator) *and* a scorer that feeds this provider. A renderer that ignores `getNoteState` simply doesn't light gems — nothing breaks.
 
 ### Audio mixer fader registration (slopsmith#87)
 
