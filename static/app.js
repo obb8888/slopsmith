@@ -5395,6 +5395,27 @@ async function bootstrapPluginsAndUi() {
 // before any playSong runs — otherwise a fast click could start
 // playback with stale settings before /api/settings returned.
 (async () => {
+    // Splitscreen pop-out windows (`?ssFollower=1`) load this same app but
+    // get driven into "follower mode" by the splitscreen plugin once it
+    // loads — which is *after* this init runs. Without this, the library
+    // (`#home`, marked `active` in index.html) renders and paints first, so
+    // the popup briefly flashes the song grid before swapping to the player.
+    // Switch to the player screen up front so the popup shows player chrome
+    // (empty, then populated by the plugin) the whole time. The wasted
+    // library fetch below is negligible next to the whole-app + every-plugin
+    // re-load a popup already does.
+    const isFollowerWindow = (() => {
+        try { return new URLSearchParams(location.search).get('ssFollower') === '1'; }
+        catch (_) { return false; }
+    })();
+    if (isFollowerWindow) {
+        // Await it — showScreen is async, so a bare call would turn even a
+        // synchronous DOM error into an unhandled rejection that this try
+        // couldn't catch. Surface failures (e.g. `#player` missing/renamed)
+        // instead of silently bringing the library flash back.
+        try { await showScreen('player'); }
+        catch (e) { console.warn('[slopsmith] follower-window: showScreen("player") failed:', e); }
+    }
     // Restore library-filter UI state from localStorage before the first
     // grid fetch so the badge/chips are accurate immediately
     // (slopsmith#129).
