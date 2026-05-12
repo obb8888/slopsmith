@@ -1,5 +1,6 @@
 """Convert Guitar Pro files (.gp5/.gp4/.gp3) to Rocksmith 2014 arrangement XML."""
 
+import logging
 import re
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
@@ -7,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import guitarpro
+
+log = logging.getLogger("slopsmith.lib.gp2rs")
 
 _YEAR_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\b")
 
@@ -102,6 +105,34 @@ class ChordTemplate:
     fingers: list[int]  # per string, -1 = unused
 
 
+@dataclass
+class PlaybackEntry:
+    """One scheduled play of one source measure.
+
+    The converter walks the GP playback graph (repeat brackets, voltas,
+    D.S./D.C./Coda/Fine) and emits a ``PlaybackEntry`` for every source
+    measure in its played order. ``mh_index`` indexes back into
+    ``song.measureHeaders`` and ``track.measures``; ``pass_index`` is 0
+    for the first time through, 1 for the second, etc. inside a repeat
+    block (0 elsewhere). The two ``*_secs`` fields together let consumers
+    shift each authored event into post-expansion (output) time:
+
+        output_time = (authored_secs - mh_authored_start_secs)
+                      + output_start_secs + audio_offset
+
+    ``duration_secs`` is the same value the schedule used when stepping
+    ``output_start_secs`` forward, so consumers (e.g. ``song_length``
+    derivation) can compute ``output_end = output_start_secs +
+    duration_secs`` without redoing the time-signature math the schedule
+    deliberately avoids for irregular / pickup measures.
+    """
+    mh_index: int
+    pass_index: int
+    output_start_secs: float
+    mh_authored_start_secs: float
+    duration_secs: float
+
+
 def _build_tempo_map(song: guitarpro.Song) -> list[TempoEvent]:
     """Build a list of (tick, tempo) events from the song."""
     events = [TempoEvent(tick=0, tempo=float(song.tempo))]
@@ -168,6 +199,253 @@ def _tempo_at_tick(tick: int, tempo_map: list[TempoEvent]) -> float:
             break
         result = event.tempo
     return result
+
+
+def _measure_duration_secs(
+    mh: guitarpro.MeasureHeader, tempo_map: list[TempoEvent]
+) -> float:
+    """Duration of one measure in seconds at its authored tempo curve.
+
+    Uses the same source-tick tempo map as :func:`_tick_to_seconds` so a
+    tempo change *inside* a measure is integrated correctly.
+    """
+    ts = mh.timeSignature
+    # numerator beats, each beat is (4 / denominator.value) quarter notes.
+    quarter_notes = ts.numerator * (4.0 / ts.denominator.value)
+    end_tick = mh.start + int(round(quarter_notes * GP_TICKS_PER_QUARTER))
+    return _tick_to_seconds(end_tick, tempo_map) - _tick_to_seconds(mh.start, tempo_map)
+
+
+# Names that may appear in MeasureHeader.fromDirection (jump *sources*).
+_DA_CAPO_NAMES = frozenset({
+    "Da Capo", "Da Capo al Coda", "Da Capo al Double Coda", "Da Capo al Fine",
+})
+_DA_SEGNO_SEGNO_NAMES = frozenset({
+    "Da Segno Segno", "Da Segno Segno al Coda",
+    "Da Segno Segno al Double Coda", "Da Segno Segno al Fine",
+})
+_DA_SEGNO_NAMES = frozenset({
+    "Da Segno", "Da Segno al Coda", "Da Segno al Double Coda", "Da Segno al Fine",
+})
+_DA_CODA_NAMES = frozenset({"Da Coda", "Da Double Coda"})
+
+
+_JUMP_BACK_NAMES = _DA_CAPO_NAMES | _DA_SEGNO_NAMES | _DA_SEGNO_SEGNO_NAMES
+
+
+def _build_playback_schedule(
+    song: guitarpro.Song,
+    tempo_map: list[TempoEvent],
+    expand_repeats: bool = True,
+) -> list[PlaybackEntry]:
+    """Walk the GP playback graph and emit one :class:`PlaybackEntry` per played measure.
+
+    Honors three nested kinds of non-linear playback when ``expand_repeats``
+    is true:
+
+    1. **D.S. / D.C. / Coda / Fine** (``MeasureHeader.fromDirection`` and
+       ``.direction``) — outermost; can teleport the cursor to a Segno,
+       Coda, or song start, and arm an "al Fine" / "al Coda" stop or
+       redirect that fires on the next pass. Checked after every emitted
+       measure, including measures inside a repeat bracket.
+    2. **Repeat brackets** (``isRepeatOpen`` / ``repeatClose`` with the
+       ``repeatAlternative`` volta bitmask) — when an open is encountered
+       the walker remembers (open, close, passes) and, after each emitted
+       measure inside the block, decides whether to loop back to the open
+       for the next pass.
+    3. **Linear walk** — fall-through; emit one entry per measure.
+
+    Conventionally, repeat brackets in a section that has been *jumped
+    back to* via D.S./D.C. play **once** ("second time, don't repeat").
+    We implement that by gating layer 2 on ``not jumped_back``.
+
+    Malformed inputs (orphan opens, unresolved D.S. targets, etc.) emit
+    a warning and fall through to a linear walk for the affected section.
+
+    Setting ``expand_repeats=False`` produces a one-entry-per-measure
+    schedule with monotonically accumulating ``output_start_secs`` — i.e.
+    the same chart the converter produced before this feature existed.
+    """
+    headers = list(song.measureHeaders)
+    if not headers:
+        return []
+
+    # Pre-compute authored start for every header. Prefer the next
+    # header's start as this header's end: a final 3/4 measure in a 4/4
+    # piece, an anacrusis at the front, or any partial / mid-song
+    # time-signature change all carry their *real* duration in the tick
+    # delta between adjacent headers. Time-signature arithmetic is only
+    # used as a fall-back for the very last measure (which has no
+    # successor to diff against).
+    authored_starts = [_tick_to_seconds(mh.start, tempo_map) for mh in headers]
+    durations: list[float] = []
+    for idx, mh in enumerate(headers):
+        if idx + 1 < len(headers):
+            durations.append(authored_starts[idx + 1] - authored_starts[idx])
+        else:
+            durations.append(_measure_duration_secs(mh, tempo_map))
+
+    # Pre-scan direction targets (Segno / Coda / Fine markers). First
+    # occurrence wins; later duplicates only get a warning.
+    targets: dict[str, int] = {}
+    for i, mh in enumerate(headers):
+        if mh.direction:
+            nm = mh.direction.name
+            if nm in targets:
+                log.warning(
+                    "gp2rs: duplicate direction target %r at measure %d "
+                    "(first occurrence at %d will be used)",
+                    nm, i, targets[nm],
+                )
+            else:
+                targets[nm] = i
+
+    schedule: list[PlaybackEntry] = []
+    output_t = 0.0
+
+    def emit(idx: int, pass_index: int) -> None:
+        nonlocal output_t
+        schedule.append(PlaybackEntry(
+            mh_index=idx,
+            pass_index=pass_index,
+            output_start_secs=output_t,
+            mh_authored_start_secs=authored_starts[idx],
+            duration_secs=durations[idx],
+        ))
+        output_t += durations[idx]
+
+    if not expand_repeats:
+        for i in range(len(headers)):
+            emit(i, 0)
+        return schedule
+
+    def find_repeat_close(start: int) -> int | None:
+        """Index of the first measure ≥ start whose ``repeatClose`` is set.
+
+        pyguitarpro encodes ``repeatClose == -1`` for "no close marker" and
+        ``repeatClose == N`` (with ``N >= 0``) for a closing marker that
+        replays the bracket ``N`` additional times. We accept any non-
+        negative value as a close so a file authored with ``repeatClose
+        == 0`` (a "decorative" close that doesn't actually loop) doesn't
+        get mis-treated as an orphan open.
+        """
+        for j in range(start, len(headers)):
+            if headers[j].repeatClose >= 0:
+                return j
+        return None
+
+    # Walker state. Repeats and directions interleave: a D.C./D.S. inside
+    # a repeat block must fire as soon as its measure is emitted, so we
+    # process repeats as a single-loop "loop back at end of pass" rather
+    # than a nested sub-loop. This makes every emitted measure flow
+    # through the same direction/jump checks below.
+    jumped_back = False             # True after the first D.S./D.C./D.S.S. fires
+    stop_at: str | None = None      # None | "fine" | "coda" | "double_coda"
+    in_repeat = False
+    repeat_open = -1
+    repeat_close = -1
+    total_passes = 1
+    pass_idx = 0
+
+    def end_of_pass(curr_i: int) -> tuple[int, bool]:
+        """Compute the next index after the current pass through the repeat
+        block ends. Returns ``(next_i, still_in_repeat)``."""
+        nonlocal pass_idx, in_repeat
+        # Did we just emit / skip past the close measure?
+        if not in_repeat or curr_i <= repeat_close:
+            return curr_i, in_repeat
+        pass_idx += 1
+        if pass_idx >= total_passes:
+            in_repeat = False
+            return repeat_close + 1, False
+        return repeat_open, True
+
+    i = 0
+    while i < len(headers):
+        mh = headers[i]
+
+        # --- (1) Detect entry into a new repeat block ---
+        if not in_repeat and mh.isRepeatOpen and not jumped_back:
+            j = find_repeat_close(i)
+            if j is None:
+                log.warning(
+                    "gp2rs: repeat-open at measure %d has no matching close; "
+                    "playing the rest of the song linearly",
+                    i,
+                )
+            else:
+                in_repeat = True
+                repeat_open = i
+                repeat_close = j
+                total_passes = max(1, headers[j].repeatClose + 1)
+                pass_idx = 0
+
+        # --- (2) Volta skip ---
+        if in_repeat:
+            ra = mh.repeatAlternative
+            if ra and not (ra & (1 << pass_idx)):
+                i += 1
+                i, _ = end_of_pass(i)
+                continue
+
+        # --- (3) "al Coda" / "al Double Coda" redirect (before emit) ---
+        if stop_at in ("coda", "double_coda") and mh.fromDirection \
+                and mh.fromDirection.name in _DA_CODA_NAMES:
+            want = "Double Coda" if mh.fromDirection.name == "Da Double Coda" \
+                else "Coda"
+            target = targets.get(want)
+            if target is None:
+                log.warning(
+                    "gp2rs: %s redirect at measure %d but no %s target found",
+                    mh.fromDirection.name, i, want,
+                )
+                stop_at = None
+            else:
+                stop_at = None
+                in_repeat = False
+                i = target
+                continue
+
+        # --- (4) Emit the measure ---
+        emit(i, pass_idx if in_repeat else 0)
+
+        # --- (5) Fine stop ---
+        if stop_at == "fine" and mh.direction and mh.direction.name == "Fine":
+            return schedule
+
+        # --- (6) D.S./D.C./D.S.S. jump (fires once, ever) ---
+        if not jumped_back and mh.fromDirection \
+                and mh.fromDirection.name in _JUMP_BACK_NAMES:
+            name = mh.fromDirection.name
+            if name in _DA_CAPO_NAMES:
+                target_idx: int | None = 0
+            elif name in _DA_SEGNO_SEGNO_NAMES:
+                target_idx = targets.get("Segno Segno")
+            else:
+                target_idx = targets.get("Segno")
+            if target_idx is None:
+                log.warning(
+                    "gp2rs: %s at measure %d has no matching target; "
+                    "continuing linearly",
+                    name, i,
+                )
+            else:
+                if "al Fine" in name:
+                    stop_at = "fine"
+                elif "al Double Coda" in name:
+                    stop_at = "double_coda"
+                elif "al Coda" in name:
+                    stop_at = "coda"
+                jumped_back = True
+                in_repeat = False  # leave any current repeat block
+                i = target_idx
+                continue
+
+        # --- (7) Advance, looping back on repeat-pass end ---
+        i += 1
+        i, _ = end_of_pass(i)
+
+    return schedule
 
 
 def _gp_string_to_rs(gp_string: int, num_strings: int) -> int:
@@ -256,6 +534,8 @@ def convert_track(
     audio_offset: float = 0.0,
     arrangement_name: str = "",
     force_standard_tuning: bool = False,
+    *,
+    expand_repeats: bool = True,
 ) -> str:
     """Convert a GP track to Rocksmith 2014 arrangement XML string.
 
@@ -265,6 +545,10 @@ def convert_track(
         audio_offset: Seconds to add to all times (for sync with audio)
         arrangement_name: "Lead", "Rhythm", "Bass", etc.
         force_standard_tuning: If True, set tuning to E standard (frets unchanged)
+        expand_repeats: When true (default), replay repeated bars and follow
+            D.S./D.C./Coda/Fine jumps so the chart matches an audio file that
+            plays the song as performed. When false, every measure is emitted
+            once in authored order — equivalent to the pre-expansion behavior.
 
     Returns:
         XML string of the Rocksmith arrangement
@@ -273,6 +557,8 @@ def convert_track(
     num_strings = len(track.strings)
     is_bass = _is_bass_track(track)
     tempo_map = _build_tempo_map(song)
+    schedule = _build_playback_schedule(song, tempo_map, expand_repeats)
+    headers = song.measureHeaders
     if force_standard_tuning:
         tuning = [0] * num_strings
     else:
@@ -289,29 +575,44 @@ def convert_track(
             arrangement_name = "Lead"
 
     # ── Collect beats (ebeats) ────────────────────────────────────────────
+    # Iterate the schedule rather than song.measureHeaders directly so each
+    # replayed pass of a repeat block emits its own downbeats / subdivisions
+    # at the correct *output* time.
     beats = []
-    for mh in song.measureHeaders:
-        t = _tick_to_seconds(mh.start, tempo_map) + audio_offset
-        beats.append(RsBeat(time=t, measure=mh.number))
-        # Subdivisions within the measure
-        tempo = _tempo_at_tick(mh.start, tempo_map)
-        ticks_per_beat = GP_TICKS_PER_QUARTER
+    for entry in schedule:
+        mh = headers[entry.mh_index]
+        beats.append(RsBeat(
+            time=entry.output_start_secs + audio_offset,
+            measure=mh.number,
+        ))
+        # Subdivisions within the measure — same authored offsets, shifted
+        # into output time by the entry's output_start.
         num_beats_in_measure = mh.timeSignature.numerator
         for b in range(1, num_beats_in_measure):
-            sub_tick = mh.start + b * ticks_per_beat
-            sub_t = _tick_to_seconds(sub_tick, tempo_map) + audio_offset
-            beats.append(RsBeat(time=sub_t, measure=-1))
+            sub_tick = mh.start + b * GP_TICKS_PER_QUARTER
+            sub_offset_in_measure = _tick_to_seconds(sub_tick, tempo_map) \
+                - entry.mh_authored_start_secs
+            beats.append(RsBeat(
+                time=entry.output_start_secs + sub_offset_in_measure + audio_offset,
+                measure=-1,
+            ))
     beats.sort(key=lambda b: b.time)
 
     # ── Collect sections from markers ─────────────────────────────────────
+    # One marker per scheduled appearance: a "verse" marker inside a ×2
+    # repeat block emits "verse #1" on pass 0 and "verse #2" on pass 1.
     sections = []
-    section_counts = {}
-    for mh in song.measureHeaders:
+    section_counts: dict[str, int] = {}
+    for entry in schedule:
+        mh = headers[entry.mh_index]
         if mh.marker and mh.marker.title:
             name = mh.marker.title.strip().lower().replace(" ", "")
             section_counts[name] = section_counts.get(name, 0) + 1
-            t = _tick_to_seconds(mh.start, tempo_map) + audio_offset
-            sections.append(RsSection(name=name, time=t, number=section_counts[name]))
+            sections.append(RsSection(
+                name=name,
+                time=entry.output_start_secs + audio_offset,
+                number=section_counts[name],
+            ))
 
     if not sections:
         # Default: one section for the whole song
@@ -323,13 +624,16 @@ def convert_track(
     chord_templates: list[ChordTemplate] = []
     chord_template_map: dict[tuple, int] = {}  # fret tuple → index
 
-    for measure in track.measures:
+    for entry in schedule:
+        measure = track.measures[entry.mh_index]
         for voice in measure.voices:
             for beat in voice.beats:
                 if not beat.notes:
                     continue
 
-                t = _tick_to_seconds(beat.start, tempo_map) + audio_offset
+                authored_beat_secs = _tick_to_seconds(beat.start, tempo_map)
+                t = (authored_beat_secs - entry.mh_authored_start_secs) \
+                    + entry.output_start_secs + audio_offset
                 tempo = _tempo_at_tick(beat.start, tempo_map)
                 dur = _duration_to_seconds(beat.duration, tempo)
 
@@ -457,11 +761,18 @@ def convert_track(
                 anchors.append(RsAnchor(time=t, fret=new_fret, width=4))
 
     # ── Compute song length ───────────────────────────────────────────────
-    last_mh = song.measureHeaders[-1]
-    song_length = _tick_to_seconds(
-        last_mh.start + last_mh.timeSignature.numerator * GP_TICKS_PER_QUARTER,
-        tempo_map,
-    ) + audio_offset
+    # End of the final scheduled measure in *output* time. After expansion
+    # this can be substantially longer than `_tick_to_seconds(last_mh.start
+    # + measure_len)` would yield on the authored timeline.
+    if schedule:
+        last_entry = schedule[-1]
+        song_length = (
+            last_entry.output_start_secs
+            + last_entry.duration_secs
+            + audio_offset
+        )
+    else:
+        song_length = audio_offset
 
     # ── Build XML ─────────────────────────────────────────────────────────
     return _build_xml(
@@ -791,6 +1102,8 @@ def convert_piano_track(
     track_index: int,
     audio_offset: float = 0.0,
     arrangement_name: str = "Keys",
+    *,
+    expand_repeats: bool = True,
 ) -> str:
     """Convert a GP piano/keyboard track to Rocksmith XML using MIDI encoding.
 
@@ -801,32 +1114,47 @@ def convert_piano_track(
     This gives a range of 0-143, covering the full piano range within
     Rocksmith's 6-string x 24-fret structure. The piano highway plugin
     decodes back via: midi = string * 24 + fret.
+
+    Honors GP repeat brackets and D.S./D.C./Coda/Fine jumps when
+    ``expand_repeats`` is true — see :func:`_build_playback_schedule`.
     """
     track = song.tracks[track_index]
     tempo_map = _build_tempo_map(song)
+    schedule = _build_playback_schedule(song, tempo_map, expand_repeats)
+    headers = song.measureHeaders
 
     # ── Collect beats ────────────────────────────────────────────────
     beats = []
-    for mh in song.measureHeaders:
-        t = _tick_to_seconds(mh.start, tempo_map) + audio_offset
-        beats.append(RsBeat(time=t, measure=mh.number))
-        tempo = _tempo_at_tick(mh.start, tempo_map)
+    for entry in schedule:
+        mh = headers[entry.mh_index]
+        beats.append(RsBeat(
+            time=entry.output_start_secs + audio_offset,
+            measure=mh.number,
+        ))
         num_beats_in_measure = mh.timeSignature.numerator
         for b in range(1, num_beats_in_measure):
             sub_tick = mh.start + b * GP_TICKS_PER_QUARTER
-            sub_t = _tick_to_seconds(sub_tick, tempo_map) + audio_offset
-            beats.append(RsBeat(time=sub_t, measure=-1))
+            sub_offset_in_measure = _tick_to_seconds(sub_tick, tempo_map) \
+                - entry.mh_authored_start_secs
+            beats.append(RsBeat(
+                time=entry.output_start_secs + sub_offset_in_measure + audio_offset,
+                measure=-1,
+            ))
     beats.sort(key=lambda b: b.time)
 
     # ── Collect sections from markers ────────────────────────────────
     sections = []
-    section_counts = {}
-    for mh in song.measureHeaders:
+    section_counts: dict[str, int] = {}
+    for entry in schedule:
+        mh = headers[entry.mh_index]
         if mh.marker and mh.marker.title:
             name = mh.marker.title.strip().lower().replace(" ", "")
             section_counts[name] = section_counts.get(name, 0) + 1
-            t = _tick_to_seconds(mh.start, tempo_map) + audio_offset
-            sections.append(RsSection(name=name, time=t, number=section_counts[name]))
+            sections.append(RsSection(
+                name=name,
+                time=entry.output_start_secs + audio_offset,
+                number=section_counts[name],
+            ))
     if not sections:
         sections.append(RsSection(name="default", time=audio_offset, number=1))
 
@@ -836,13 +1164,16 @@ def convert_piano_track(
     chord_templates: list[ChordTemplate] = []
     chord_template_map: dict[tuple, int] = {}
 
-    for measure in track.measures:
+    for entry in schedule:
+        measure = track.measures[entry.mh_index]
         for voice in measure.voices:
             for beat in voice.beats:
                 if not beat.notes:
                     continue
 
-                t = _tick_to_seconds(beat.start, tempo_map) + audio_offset
+                authored_beat_secs = _tick_to_seconds(beat.start, tempo_map)
+                t = (authored_beat_secs - entry.mh_authored_start_secs) \
+                    + entry.output_start_secs + audio_offset
                 tempo = _tempo_at_tick(beat.start, tempo_map)
                 dur = _duration_to_seconds(beat.duration, tempo)
 
@@ -918,11 +1249,15 @@ def convert_piano_track(
     anchors = [RsAnchor(time=audio_offset, fret=1, width=24)]
 
     # ── Song length ──────────────────────────────────────────────────
-    last_mh = song.measureHeaders[-1]
-    song_length = _tick_to_seconds(
-        last_mh.start + last_mh.timeSignature.numerator * GP_TICKS_PER_QUARTER,
-        tempo_map,
-    ) + audio_offset
+    if schedule:
+        last_entry = schedule[-1]
+        song_length = (
+            last_entry.output_start_secs
+            + last_entry.duration_secs
+            + audio_offset
+        )
+    else:
+        song_length = audio_offset
 
     # ── Build XML ────────────────────────────────────────────────────
     # Use all-zero tuning (piano has no tuning concept)
@@ -951,6 +1286,8 @@ def convert_drum_track(
     track_index: int,
     audio_offset: float = 0.0,
     arrangement_name: str = "Drums",
+    *,
+    expand_repeats: bool = True,
 ) -> str:
     """Convert a GP drum/percussion track to Rocksmith XML using MIDI encoding.
 
@@ -960,31 +1297,47 @@ def convert_drum_track(
 
     The drum highway plugin decodes back via: midi = string * 24 + fret
     and maps to the appropriate drum lane (kick, snare, hi-hat, etc.).
+
+    Honors GP repeat brackets and D.S./D.C./Coda/Fine jumps when
+    ``expand_repeats`` is true — see :func:`_build_playback_schedule`.
     """
     track = song.tracks[track_index]
     tempo_map = _build_tempo_map(song)
+    schedule = _build_playback_schedule(song, tempo_map, expand_repeats)
+    headers = song.measureHeaders
 
     # ── Collect beats ────────────────────────────────────────────────
     beats = []
-    for mh in song.measureHeaders:
-        t = _tick_to_seconds(mh.start, tempo_map) + audio_offset
-        beats.append(RsBeat(time=t, measure=mh.number))
+    for entry in schedule:
+        mh = headers[entry.mh_index]
+        beats.append(RsBeat(
+            time=entry.output_start_secs + audio_offset,
+            measure=mh.number,
+        ))
         num_beats_in_measure = mh.timeSignature.numerator
         for b in range(1, num_beats_in_measure):
             sub_tick = mh.start + b * GP_TICKS_PER_QUARTER
-            sub_t = _tick_to_seconds(sub_tick, tempo_map) + audio_offset
-            beats.append(RsBeat(time=sub_t, measure=-1))
+            sub_offset_in_measure = _tick_to_seconds(sub_tick, tempo_map) \
+                - entry.mh_authored_start_secs
+            beats.append(RsBeat(
+                time=entry.output_start_secs + sub_offset_in_measure + audio_offset,
+                measure=-1,
+            ))
     beats.sort(key=lambda b: b.time)
 
     # ── Collect sections from markers ────────────────────────────────
     sections = []
-    section_counts = {}
-    for mh in song.measureHeaders:
+    section_counts: dict[str, int] = {}
+    for entry in schedule:
+        mh = headers[entry.mh_index]
         if mh.marker and mh.marker.title:
             name = mh.marker.title.strip().lower().replace(" ", "")
             section_counts[name] = section_counts.get(name, 0) + 1
-            t = _tick_to_seconds(mh.start, tempo_map) + audio_offset
-            sections.append(RsSection(name=name, time=t, number=section_counts[name]))
+            sections.append(RsSection(
+                name=name,
+                time=entry.output_start_secs + audio_offset,
+                number=section_counts[name],
+            ))
     if not sections:
         sections.append(RsSection(name="default", time=audio_offset, number=1))
 
@@ -994,13 +1347,16 @@ def convert_drum_track(
     chord_templates: list[ChordTemplate] = []
     chord_template_map: dict[tuple, int] = {}
 
-    for measure in track.measures:
+    for entry in schedule:
+        measure = track.measures[entry.mh_index]
         for voice in measure.voices:
             for beat in voice.beats:
                 if not beat.notes:
                     continue
 
-                t = _tick_to_seconds(beat.start, tempo_map) + audio_offset
+                authored_beat_secs = _tick_to_seconds(beat.start, tempo_map)
+                t = (authored_beat_secs - entry.mh_authored_start_secs) \
+                    + entry.output_start_secs + audio_offset
 
                 beat_notes = []
                 for note in beat.notes:
@@ -1074,11 +1430,15 @@ def convert_drum_track(
     anchors = [RsAnchor(time=audio_offset, fret=1, width=24)]
 
     # ── Song length ──────────────────────────────────────────────────
-    last_mh = song.measureHeaders[-1]
-    song_length = _tick_to_seconds(
-        last_mh.start + last_mh.timeSignature.numerator * GP_TICKS_PER_QUARTER,
-        tempo_map,
-    ) + audio_offset
+    if schedule:
+        last_entry = schedule[-1]
+        song_length = (
+            last_entry.output_start_secs
+            + last_entry.duration_secs
+            + audio_offset
+        )
+    else:
+        song_length = audio_offset
 
     # ── Build XML ────────────────────────────────────────────────────
     return _build_xml(
@@ -1108,6 +1468,8 @@ def convert_file(
     audio_offset: float = 0.0,
     arrangement_names: dict[int, str] | None = None,
     force_standard_tuning: bool = False,
+    *,
+    expand_repeats: bool = True,
 ) -> list[str]:
     """Convert a GP file to Rocksmith XMLs.
 
@@ -1118,6 +1480,12 @@ def convert_file(
         audio_offset: Seconds to add for audio sync
         arrangement_names: Override arrangement names {track_idx: name}
         force_standard_tuning: Force E standard tuning (frets unchanged)
+        expand_repeats: When true (default), the converter walks the GP
+            playback graph — replaying repeat brackets, honoring volta
+            (1st/2nd-ending) markers, and following D.S./D.C./Coda/Fine
+            jumps — so the emitted arrangement matches a linear audio file
+            playing the song as performed. Pass false to recover the legacy
+            as-written behavior (each measure emitted exactly once).
 
     Returns:
         List of output XML file paths
@@ -1142,16 +1510,19 @@ def convert_file(
         # Route drum/percussion tracks through drum converter
         if is_drum_track(track) or (arr_name and arr_name.lower().startswith("drums")):
             xml_str = convert_drum_track(
-                song, idx, audio_offset, arr_name or "Drums"
+                song, idx, audio_offset, arr_name or "Drums",
+                expand_repeats=expand_repeats,
             )
         # Route piano/keyboard tracks through the MIDI-encoding converter
         elif is_piano_track(track) or (arr_name and arr_name.lower().startswith("keys")):
             xml_str = convert_piano_track(
-                song, idx, audio_offset, arr_name or "Keys"
+                song, idx, audio_offset, arr_name or "Keys",
+                expand_repeats=expand_repeats,
             )
         else:
             xml_str = convert_track(
-                song, idx, audio_offset, arr_name, force_standard_tuning
+                song, idx, audio_offset, arr_name, force_standard_tuning,
+                expand_repeats=expand_repeats,
             )
 
         safe_name = track.name.strip().replace(" ", "_").replace("/", "_")
