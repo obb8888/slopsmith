@@ -279,6 +279,7 @@ Click 'Deploy the stack'. This creates a container named 'slopsmith-web'.
 Access Slopsmith at: http://server-ip:7000
 
 **Step 6:** Add the DLC Manager
+
 Clone the DLC Manager repository on the host machine and copy to container.
 ```bash
 cd /home/your_user
