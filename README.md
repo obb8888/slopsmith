@@ -241,6 +241,7 @@ sudo docker run -d -p 9000:9000 --restart always -v /var/run/docker.sock:/var/ru
 Step 3: Access the Portainer Web Interface
 Open the following URL in your browser:
     • http://server-ip:9000
+
 Step 4: Pull the Slopsmith Image
 In Portainer, go to the Images tab and build a new image using the following settings:
     • Image Name: slopsmith:latest
