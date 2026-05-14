@@ -278,9 +278,9 @@ volumes
 Click 'Deploy the stack'. This creates a container named 'slopsmith-web'.
 Access Slopsmith at: http://server-ip:7000
 
-**Step 6:** Add the DLC Manager
+**Step 6:** Add the Update Manager
 
-Clone the DLC Manager repository on the host machine and copy to container.
+Clone the Update Manager repository on the host machine and copy to container.
 ```bash
 cd /home/your_user
 git clone https://github.com/byrongamatos/slopsmith-update-manager.git  update_manager
