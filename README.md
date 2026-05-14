@@ -292,7 +292,7 @@ In the Portainer web interface, go to Containers, select 'slopsmith-web', and re
 
 **Step 8:** Install Recommended Plugins
 
-Open Slopsmith at http://server-ip:7000 and install the following recommended plugins:
+Open Slopsmith at http://server-ip:7000 and install the following recommended plugins via the update manager:
 
     • NAM Tone Engine - Enables Slopsmith to interface with your guitar/audio cable.
         1. Download amp models and cabinet IRs from: https://www.tone3000.com/
