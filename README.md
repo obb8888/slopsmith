@@ -227,18 +227,18 @@ The script is linted with `shellcheck`. Only `amd64` is supported out of the box
 
 This guide walks through installing Docker, Portainer, and Slopsmith on Ubuntu.
 
-Step 1: Update Package Lists & install docker
+**Step 1:** Update Package Lists & install docker
 ```bash
 sudo apt update
 sudo apt install docker.io -y
 sudo usermod -aG docker $USER
 ```
-Step 2: Install Portainer on Ubuntu
+**Step 2:** Install Portainer on Ubuntu
 ```bash
 sudo docker pull portainer/portainer-ce:latest
 sudo docker run -d -p 9000:9000 --restart always -v /var/run/docker.sock:/var/run/docker.sock portainer/portainer-ce:latest
 ```
-Step 3: Access the Portainer Web Interface
+**Step 3:** Access the Portainer Web Interface
 Open the following URL in your browser:
 
     • http://server-ip:9000
