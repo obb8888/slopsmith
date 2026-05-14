@@ -273,8 +273,8 @@ services:
       CONFIG_DIR: /config
 
 volumes:
-  slopsmith-config:
 ```
+  slopsmith-config:
     • Click 'Deploy the stack'. This creates a container named 'slopsmith-web'.
     • Access Slopsmith at: http://server-ip:7000
 Step 6: Add the DLC Manager
