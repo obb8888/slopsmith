@@ -283,8 +283,8 @@ Access Slopsmith at: http://server-ip:7000
 Clone the DLC Manager repository on the host machine and copy to container.
 ```bash
 cd /home/your_user
-git clone https://github.com/byrongamatos/slopsmith-plugin-ug.git ultimate_guitar
-sudo docker cp /home/your_user/ultimate_guitar slopsmith-web:/app/plugins/
+git clone https://github.com/byrongamatos/slopsmith-update-manager.git  update_manager
+sudo docker cp /home/your_user/update_manager slopsmith-web:/app/plugins/
 ```
 **Step 7:** Restart the Slopsmith Container
 In the Portainer web interface, go to Containers, select 'slopsmith-web', and restart the container.
