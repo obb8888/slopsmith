@@ -243,14 +243,14 @@ Open the following URL in your browser:
 
     • http://server-ip:9000
 
-Step 4: Pull the Slopsmith Image
+**Step 4:** Pull the Slopsmith Image
 In Portainer, go to the Images tab and build a new image using the following settings:
 
     • Image Name: slopsmith:latest
     
     • Repository URL: https://github.com/byrongamatos/slopsmith.git
 
-Step 5: Create a Stack for Slopsmith
+**Step 5:** Create a Stack for Slopsmith
 Click '+ Add Stack' and paste the following Docker Compose configuration into the editor. Replace '/path/to/dlc/' with the correct path where your dlc is on your host system.
 ```bash
 version: "3.9"
@@ -278,16 +278,16 @@ volumes
 Click 'Deploy the stack'. This creates a container named 'slopsmith-web'.
 Access Slopsmith at: http://server-ip:7000
 
-Step 6: Add the DLC Manager
+**Step 6:** Add the DLC Manager
 Clone the DLC Manager repository on the host machine and copy to container.
 ```bash
 cd /home/your_user
 git clone https://github.com/byrongamatos/slopsmith-plugin-ug.git ultimate_guitar
 sudo docker cp /home/your_user/ultimate_guitar slopsmith-web:/app/plugins/
 ```
-Step 7: Restart the Slopsmith Container
+**Step 7:** Restart the Slopsmith Container
 In the Portainer web interface, go to Containers, select 'slopsmith-web', and restart the container.
-Step 8: Install Recommended Plugins
+**Step 8:** Install Recommended Plugins
 Open Slopsmith at http://server-ip:7000 and install the following recommended plugins:
     • NAM Tone Engine - Enables Slopsmith to interface with your guitar/audio cable.
         1. Download amp models and cabinet IRs from: https://www.tone3000.com/
