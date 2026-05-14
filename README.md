@@ -227,8 +227,7 @@ The script is linted with `shellcheck`. Only `amd64` is supported out of the box
 
 This guide walks through installing Docker, Portainer, and Slopsmith on Ubuntu.
 
-Step 1: Update Package Lists
-Log into your server instance and update the local package index.
+Step 1: Update Package Lists & install docker
 ```bash
 sudo apt update
 sudo apt install docker.io -y
@@ -247,7 +246,7 @@ In Portainer, go to the Images tab and build a new image using the following set
     • Image Name: slopsmith:latest
     • Repository URL: https://github.com/byrongamatos/slopsmith.git
 Step 5: Create a Stack for Slopsmith
-Click '+ Add Stack' and paste the following Docker Compose configuration into the editor. Replace '/path/to/dlc/' with the correct path on your host system.
+Click '+ Add Stack' and paste the following Docker Compose configuration into the editor. Replace '/path/to/dlc/' with the correct path where your dlc is on your host system.
 ```bash
 version: "3.9"
 
