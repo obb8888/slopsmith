@@ -246,6 +246,7 @@ Step 4: Pull the Slopsmith Image
 In Portainer, go to the Images tab and build a new image using the following settings:
     • Image Name: slopsmith:latest
     • Repository URL: https://github.com/byrongamatos/slopsmith.git
+
 Step 5: Create a Stack for Slopsmith
 Click '+ Add Stack' and paste the following Docker Compose configuration into the editor. Replace '/path/to/dlc/' with the correct path where your dlc is on your host system.
 ```bash
