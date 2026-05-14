@@ -283,7 +283,7 @@ Access Slopsmith at: http://server-ip:7000
 Clone the Update Manager repository on the host machine and copy to container.
 ```bash
 cd /home/your_user
-git clone https://github.com/byrongamatos/slopsmith-update-manager.git  update_manager
+git clone https://github.com/byrongamatos/slopsmith-update-manager.git update_manager
 sudo docker cp /home/your_user/update_manager slopsmith-web:/app/plugins/
 ```
 **Step 7:** Restart the Slopsmith Container
